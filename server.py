@@ -31,6 +31,9 @@ PING_CADENCE = 50.0  # 50-second cycle
 PING_TIMEOUT = 60.0  # 60-second CLI timeout
 
 status_lock = threading.Lock()
+import collections
+log_history = collections.deque(maxlen=200)
+
 relay_state = {
     "status": "INITIALIZING",
     "active_account_index": 0,
@@ -52,7 +55,10 @@ relay_state = {
 
 def log(msg):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{now}] [RENDER-SUPERVISOR] {msg}", flush=True)
+    line = f"[{now}] [RENDER-SUPERVISOR] {msg}"
+    print(line, flush=True)
+    with status_lock:
+        log_history.append(line)
 
 def setup_credentials():
     os.makedirs(CFG_DIR, exist_ok=True)
@@ -225,9 +231,11 @@ def supervisor_worker():
                 relay_state["last_cycle_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                 relay_state["last_cycle_status"] = f"{script_name}: code {r_exec.returncode} in {exec_duration:.1f}s"
 
-            if r_exec.returncode != 0 and "not found" in r_exec.stdout.lower():
-                log(f"CRITICAL: Session '{curr_session}' lost! Re-provisioning immediately...")
-                provision_session(curr_session)
+            if r_exec.returncode != 0:
+                log(f"[{script_name}] CLI error ({r_exec.returncode}): {r_exec.stdout.strip()[:150]}")
+                if "not found" in r_exec.stdout.lower() or "lost" in r_exec.stdout.lower() or "error" in r_exec.stdout.lower():
+                    log(f"CRITICAL: Session '{curr_session}' unhealthy! Re-provisioning immediately...")
+                    provision_session(curr_session)
 
             # Check ingress
             if cycle % 2 == 0:
@@ -264,3 +272,43 @@ def get_health():
             "last_cycle": relay_state["last_cycle_status"],
             "ingress": relay_state["ingress_status"]
         }
+
+@app.get("/logs")
+def get_logs():
+    with status_lock:
+        return list(log_history)
+
+@app.post("/backup-test")
+def run_backup_test():
+    with status_lock:
+        curr_session = relay_state["active_session"]
+
+    log(f"Running on-demand backup test on '{curr_session}'...")
+    test_code = """
+import os, time, subprocess
+
+canary_time = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+with open('/content/workspace/canary.txt', 'w') as f:
+    f.write(f'Canary verification generated at {canary_time}\\n')
+
+print('Compressing /content/workspace...')
+cmd_tar = ['tar', '-czf', '/content/colab_bundle.tar.gz', '-C', '/content', 'workspace']
+r_tar = subprocess.run(cmd_tar, capture_output=True, text=True)
+print('Tar returncode:', r_tar.returncode)
+
+print('Uploading to Google Drive...')
+cmd_rclone = [
+    'rclone', 'copy', '/content/colab_bundle.tar.gz',
+    'gdrive:coolify-relay-state/colab-relay-state/',
+    '--drive-chunk-size=32M', '--buffer-size=32M'
+]
+r_rc = subprocess.run(cmd_rclone, capture_output=True, text=True)
+print('Rclone returncode:', r_rc.returncode, r_rc.stderr)
+"""
+    r = run_cli_cmd(["colab", "exec", "-s", curr_session, "--timeout", "120"], input_data=test_code)
+    log(f"Backup test completed with code {r.returncode}")
+    return {
+        "session": curr_session,
+        "returncode": r.returncode,
+        "output": r.stdout.strip()
+    }
