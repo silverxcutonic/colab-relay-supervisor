@@ -128,8 +128,87 @@ def run_cli_cmd(cmd, input_data=None, timeout=90):
         timeout=timeout
     )
 
+keepalive_client = None
+
+class PersistentKeepaliveClient:
+    def __init__(self, session_name):
+        self.session_name = session_name
+        self.runtime = None
+        self._connected = False
+
+    def connect(self):
+        from colab_cli.common import state
+        from colab_cli.runtime import ColabRuntime
+
+        s = state.get_session(self.session_name, ignore_missing_session=True)
+        if not s:
+            raise RuntimeError(f"Session '{self.session_name}' not found.")
+
+        def on_started(kid):
+            s.kernel_id = kid
+            state.store.add(s)
+
+        def on_sess_started(sid):
+            s.session_id = sid
+            state.store.add(s)
+
+        self.runtime = ColabRuntime(
+            s.url,
+            s.token,
+            session_name=self.session_name,
+            kernel_id=s.kernel_id,
+            session_id=s.session_id,
+            on_kernel_started=on_started,
+            on_session_started=on_sess_started,
+        )
+        # Access kernel_client property to start WebSocket in background thread
+        _ = self.runtime.kernel_client
+        self._connected = True
+        log(f"Persistent WebSocket attached to kernel on session '{self.session_name}'.")
+
+    def execute(self, code, timeout=60):
+        for attempt in range(2):
+            try:
+                if not self._connected or not self.runtime:
+                    self.connect()
+                outputs = self.runtime.execute_code(code, timeout=timeout)
+                is_error = any(o.get("output_type") == "error" for o in outputs)
+                output_text = "\n".join(
+                    o.get("text", "") if o.get("output_type") == "stream"
+                    else f"{o.get('ename')}: {o.get('evalue')}"
+                    for o in outputs
+                )
+                return (1 if is_error else 0), output_text
+            except Exception as e:
+                log(f"Persistent client execute attempt {attempt+1} error: {e}")
+                self.close()
+                if attempt == 1:
+                    raise e
+
+    def close(self):
+        if self.runtime:
+            try:
+                self.runtime.stop()
+            except Exception:
+                pass
+            self.runtime = None
+            self._connected = False
+
+def get_ping_code(script_name):
+    path = os.path.join(APP_DIR, script_name)
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return f.read()
+    return f"""import time, sys
+print("[{script_name}] Starting 40s duty cycle...", flush=True)
+for i in range(8):
+    time.sleep(5)
+    print(f"[{script_name}] Active tick {{i+1}}/8 | Kernel BUSY", flush=True)
+print("[{script_name}] Finished duty cycle.", flush=True)
+"""
+
 def backup_session(session_name):
-    script_path = os.path.join(APP_DIR, "backup_action.py")
+    global keepalive_client
     test_code = """import os, time, subprocess
 
 canary_time = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
@@ -150,15 +229,19 @@ cmd_rclone = [
 r_rc = subprocess.run(cmd_rclone, capture_output=True, text=True)
 print('Rclone returncode:', r_rc.returncode, r_rc.stderr.strip())
 """
-    with open(script_path, "w") as f:
-        f.write(test_code)
-
     try:
         with colab_lock:
             log(f"Executing backup on '{session_name}'...")
-            r = run_cli_cmd(["colab", "exec", "-s", session_name, "-f", script_path, "--timeout", "150"], timeout=180)
-            log(f"Backup on '{session_name}' finished with code {r.returncode}")
-            return r.returncode, r.stdout.strip()
+            if keepalive_client and keepalive_client.session_name == session_name:
+                code, out = keepalive_client.execute(test_code, timeout=180)
+            else:
+                script_path = os.path.join(APP_DIR, "backup_action.py")
+                with open(script_path, "w") as f:
+                    f.write(test_code)
+                r = run_cli_cmd(["colab", "exec", "-s", session_name, "-f", script_path, "--timeout", "150"], timeout=180)
+                code, out = r.returncode, r.stdout.strip()
+            log(f"Backup on '{session_name}' finished with code {code}")
+            return code, out
     except Exception as e:
         log(f"Backup exception on '{session_name}': {e}")
         return -1, str(e)
@@ -195,6 +278,7 @@ def provision_session(session_name):
     return True
 
 def supervisor_worker():
+    global keepalive_client
     setup_credentials()
 
     curr_idx = 0
@@ -205,6 +289,12 @@ def supervisor_worker():
     r = run_cli_cmd(["colab", "ls"])
     if curr_session not in r.stdout:
         provision_session(curr_session)
+
+    try:
+        keepalive_client = PersistentKeepaliveClient(curr_session)
+        keepalive_client.connect()
+    except Exception as e:
+        log(f"Initial keepalive client connection error: {e}")
 
     with status_lock:
         relay_state["status"] = "RUNNING"
@@ -237,6 +327,10 @@ def supervisor_worker():
                 log(f"Backing up current session '{curr_session}' before handover...")
                 backup_session(curr_session)
 
+                if keepalive_client:
+                    keepalive_client.close()
+                    keepalive_client = None
+
                 # Switch to successor token and provision
                 set_active_token(next_idx)
                 if provision_session(next_session):
@@ -245,36 +339,59 @@ def supervisor_worker():
                     run_cli_cmd(["colab", "stop", "-s", curr_session])
                     set_active_token(next_idx)
 
+                    keepalive_client = PersistentKeepaliveClient(next_session)
+                    keepalive_client.connect()
+
                     with status_lock:
                         relay_state["active_account_index"] = next_idx
                         relay_state["active_session"] = next_session
                         relay_state["shift_start_time"] = time.time()
-                    log("Handover complete! Continuing bouncer on successor.")
+                    log("Handover complete! Continuing persistent bouncer on successor.")
                 else:
                     log("Handover failed. Retrying in 60s...")
                     time.sleep(60)
                     continue
 
+            # Ensure keepalive client is connected
+            if not keepalive_client or keepalive_client.session_name != curr_session:
+                try:
+                    if keepalive_client:
+                        keepalive_client.close()
+                    keepalive_client = PersistentKeepaliveClient(curr_session)
+                    keepalive_client.connect()
+                except Exception as e:
+                    log(f"Error reconnecting keepalive client: {e}")
+                    time.sleep(5)
+                    continue
+
             # Run ping-pong keepalive cycle
             cycle += 1
-            script_file = os.path.join(APP_DIR, "ping_a.py" if (cycle % 2 != 0) else "ping_b.py")
             script_name = "ping_a.py" if (cycle % 2 != 0) else "ping_b.py"
+            code_to_run = get_ping_code(script_name)
 
             with colab_lock:
                 cycle_start = time.time()
-                r_exec = run_cli_cmd(["colab", "exec", "-s", curr_session, "-f", script_file, "--timeout", str(PING_TIMEOUT)], timeout=75)
+                try:
+                    code_res, out_text = keepalive_client.execute(code_to_run, timeout=PING_TIMEOUT + 15)
+                except Exception as e:
+                    code_res, out_text = 1, str(e)
                 exec_duration = time.time() - cycle_start
 
             with status_lock:
                 relay_state["total_cycles"] = cycle
                 relay_state["last_cycle_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                relay_state["last_cycle_status"] = f"{script_name}: code {r_exec.returncode} in {exec_duration:.1f}s"
+                relay_state["last_cycle_status"] = f"{script_name}: code {code_res} in {exec_duration:.1f}s"
 
-            if r_exec.returncode != 0:
-                log(f"[{script_name}] CLI error ({r_exec.returncode}): {r_exec.stdout.strip()[:150]}")
-                if "not found" in r_exec.stdout.lower() or "lost" in r_exec.stdout.lower() or "error" in r_exec.stdout.lower():
+            if code_res != 0:
+                log(f"[{script_name}] Execution error ({code_res}): {out_text.strip()[:150]}")
+                if "not found" in out_text.lower() or "lost" in out_text.lower() or "error" in out_text.lower() or "404" in out_text or "401" in out_text:
                     log(f"CRITICAL: Session '{curr_session}' unhealthy! Re-provisioning immediately...")
+                    if keepalive_client:
+                        keepalive_client.close()
+                        keepalive_client = None
                     provision_session(curr_session)
+                    keepalive_client = PersistentKeepaliveClient(curr_session)
+                    keepalive_client.connect()
 
             # Check ingress
             if cycle % 2 == 0:
