@@ -183,27 +183,6 @@ def get_current_endpoint(session_name):
             pass
     return None
 
-def send_tfe_keepalive(endpoint):
-    """
-    Sends Google TFE control-plane keep-alive GET request:
-    GET https://colab.research.google.com/tun/m/{endpoint}/keep-alive/?authuser=0
-    Header: X-Colab-Tunnel: Google
-    Signals the Google Colab web frontend router that this session is actively
-    supervised, defeating the ~2.5-3h unmonitored headless container reaper.
-    """
-    if not endpoint or endpoint in ("UNKNOWN", "NEWLY_PROVISIONED"):
-        return False, "NO_ENDPOINT"
-    try:
-        from colab_cli.common import state
-        url = f"https://colab.research.google.com/tun/m/{endpoint}/keep-alive/?authuser=0"
-        headers = {"X-Colab-Tunnel": "Google"}
-        resp = state.client.session.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            return True, "HTTP 200 OK"
-        return False, f"HTTP {resp.status_code}"
-    except Exception as e:
-        return False, str(e)
-
 def auto_adopt_or_provision():
     """
     Auto-adopt any currently live Colab VM across the 3 accounts on startup.
@@ -243,26 +222,15 @@ def auto_adopt_or_provision():
     ep = get_current_endpoint(session_name) or "UNKNOWN"
     return 0, session_name, ep
 
-def execute_keepalive_pulse(session_name, cycle_num, endpoint=None):
+def execute_keepalive_pulse(session_name, cycle_num):
     """
-    Executes the validated Dual-Shield keepalive cycle:
-    - Shield 1: 40-second active duty cycle via stdin (keeps kernel BUSY, defeats 11m 40s idle reaper)
-    - Shield 2: Google TFE /tun/m/{endpoint}/keep-alive/ heartbeat (defeats ~2.5-3h headless reaper)
+    Executes the validated 40-second active duty cycle via stdin.
+    Maintains the Jupyter kernel in BUSY state and keeps an interactive WebSocket open.
     """
     script_name = "PING-A" if (cycle_num % 2 != 0) else "PING-B"
     code = PING_CODE_A if (cycle_num % 2 != 0) else PING_CODE_B
     start = time.time()
 
-    if not endpoint or endpoint in ("UNKNOWN", "NEWLY_PROVISIONED"):
-        endpoint = get_current_endpoint(session_name)
-        if endpoint:
-            with status_lock:
-                relay_state["active_endpoint"] = endpoint
-
-    # Shield 2: Google TFE web heartbeat
-    tfe_ok, tfe_status = send_tfe_keepalive(endpoint)
-
-    # Shield 1: Stdin 40s kernel busy duty cycle
     try:
         r = subprocess.run(
             [VENV_COLAB, "exec", "-s", session_name, "--timeout", str(int(CLI_TIMEOUT))],
@@ -275,17 +243,17 @@ def execute_keepalive_pulse(session_name, cycle_num, endpoint=None):
         elapsed = time.time() - start
         out = r.stdout.strip().replace("\n", " | ")[:120]
         success = (r.returncode == 0)
-        log(f"[Cycle {cycle_num:04d}] {script_name} exit={r.returncode} in {elapsed:.1f}s | TFE: {tfe_status} | {out}")
-        return success, r.returncode, elapsed, out, tfe_status
+        log(f"[Cycle {cycle_num:04d}] {script_name} exit={r.returncode} in {elapsed:.1f}s | {out}")
+        return success, r.returncode, elapsed, out
     except subprocess.TimeoutExpired:
         elapsed = time.time() - start
-        log(f"WARNING: Keepalive cycle {cycle_num:04d} timed out after {elapsed:.1f}s | TFE: {tfe_status}; cleaning hanging child processes...")
+        log(f"WARNING: Keepalive cycle {cycle_num:04d} timed out after {elapsed:.1f}s; cleaning hanging child processes...")
         subprocess.run(["pkill", "-f", f"colab exec -s {session_name}"], check=False)
-        return False, -1, elapsed, "TimeoutExpired", tfe_status
+        return False, -1, elapsed, "TimeoutExpired"
     except Exception as e:
         elapsed = time.time() - start
-        log(f"ERROR: Keepalive exception: {e} in {elapsed:.1f}s | TFE: {tfe_status}")
-        return False, -1, elapsed, str(e), tfe_status
+        log(f"ERROR: Keepalive exception: {e} in {elapsed:.1f}s")
+        return False, -1, elapsed, str(e)
 
 def provision_session(session_name):
     """
@@ -409,18 +377,15 @@ def supervisor_worker():
                         with status_lock:
                             relay_state["shift_duration_seconds"] += 600
 
-            # === EXECUTE VERIFIED DUAL-SHIELD KEEPALIVE PULSE ===
+            # === EXECUTE VERIFIED KEEPALIVE PULSE ===
             cycle += 1
-            with status_lock:
-                curr_endpoint = relay_state.get("active_endpoint")
             with colab_lock:
-                success, code_res, exec_duration, out_text, tfe_res = execute_keepalive_pulse(curr_session, cycle, curr_endpoint)
+                success, code_res, exec_duration, out_text = execute_keepalive_pulse(curr_session, cycle)
 
             with status_lock:
                 relay_state["total_cycles"] = cycle
                 relay_state["last_cycle_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                 relay_state["last_cycle_status"] = f"code {code_res} in {exec_duration:.1f}s"
-                relay_state["last_tfe_status"] = tfe_res
                 if success:
                     relay_state["consecutive_failures"] = 0
                 else:
@@ -469,7 +434,6 @@ def get_health():
             "shift_elapsed_mins": relay_state["shift_elapsed_seconds"] // 60,
             "shift_remaining_mins": relay_state["shift_remaining_seconds"] // 60,
             "last_cycle": relay_state["last_cycle_status"],
-            "tfe_status": relay_state.get("last_tfe_status", "UNKNOWN"),
             "ingress": relay_state["ingress_status"],
             "consecutive_failures": relay_state["consecutive_failures"]
         }
