@@ -240,7 +240,8 @@ def auto_adopt_or_provision():
     set_active_token(0)
     session_name = "colab-worker-01"
     provision_session(session_name)
-    return 0, session_name, "NEWLY_PROVISIONED"
+    ep = get_current_endpoint(session_name) or "UNKNOWN"
+    return 0, session_name, ep
 
 def execute_keepalive_pulse(session_name, cycle_num, endpoint=None):
     """
@@ -252,7 +253,7 @@ def execute_keepalive_pulse(session_name, cycle_num, endpoint=None):
     code = PING_CODE_A if (cycle_num % 2 != 0) else PING_CODE_B
     start = time.time()
 
-    if not endpoint or endpoint == "UNKNOWN":
+    if not endpoint or endpoint in ("UNKNOWN", "NEWLY_PROVISIONED"):
         endpoint = get_current_endpoint(session_name)
         if endpoint:
             with status_lock:
