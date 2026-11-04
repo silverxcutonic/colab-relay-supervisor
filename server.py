@@ -31,6 +31,7 @@ PING_CADENCE = 50.0  # 50-second cycle
 PING_TIMEOUT = 60.0  # 60-second CLI timeout
 
 status_lock = threading.Lock()
+colab_lock = threading.Lock()
 import collections
 log_history = collections.deque(maxlen=200)
 
@@ -127,6 +128,41 @@ def run_cli_cmd(cmd, input_data=None, timeout=90):
         timeout=timeout
     )
 
+def backup_session(session_name):
+    script_path = os.path.join(APP_DIR, "backup_action.py")
+    test_code = """import os, time, subprocess
+
+canary_time = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+with open('/content/workspace/canary.txt', 'w') as f:
+    f.write(f'Canary verification generated at {canary_time}\\n')
+
+print('Compressing /content/workspace...')
+cmd_tar = ['tar', '-czf', '/content/colab_bundle.tar.gz', '-C', '/content', 'workspace']
+r_tar = subprocess.run(cmd_tar, capture_output=True, text=True)
+print('Tar returncode:', r_tar.returncode)
+
+print('Uploading to Google Drive...')
+cmd_rclone = [
+    'rclone', 'copy', '/content/colab_bundle.tar.gz',
+    'gdrive:coolify-relay-state/colab-relay-state/',
+    '--drive-chunk-size=32M', '--buffer-size=32M'
+]
+r_rc = subprocess.run(cmd_rclone, capture_output=True, text=True)
+print('Rclone returncode:', r_rc.returncode, r_rc.stderr.strip())
+"""
+    with open(script_path, "w") as f:
+        f.write(test_code)
+
+    try:
+        with colab_lock:
+            log(f"Executing backup on '{session_name}'...")
+            r = run_cli_cmd(["colab", "exec", "-s", session_name, "-f", script_path, "--timeout", "150"], timeout=180)
+            log(f"Backup on '{session_name}' finished with code {r.returncode}")
+            return r.returncode, r.stdout.strip()
+    except Exception as e:
+        log(f"Backup exception on '{session_name}': {e}")
+        return -1, str(e)
+
 def provision_session(session_name):
     log(f"Provisioning session '{session_name}'...")
     r = run_cli_cmd(["colab", "new", "-s", session_name], timeout=60)
@@ -198,6 +234,9 @@ def supervisor_worker():
                 next_idx = (curr_idx + 1) % 3
                 next_session = f"colab-worker-{next_idx+1:02d}"
 
+                log(f"Backing up current session '{curr_session}' before handover...")
+                backup_session(curr_session)
+
                 # Switch to successor token and provision
                 set_active_token(next_idx)
                 if provision_session(next_session):
@@ -221,10 +260,10 @@ def supervisor_worker():
             script_file = os.path.join(APP_DIR, "ping_a.py" if (cycle % 2 != 0) else "ping_b.py")
             script_name = "ping_a.py" if (cycle % 2 != 0) else "ping_b.py"
 
-            cycle_start = time.time()
-            r_exec = run_cli_cmd(["colab", "exec", "-s", curr_session, "-f", script_file, "--timeout", str(PING_TIMEOUT)], timeout=75)
-
-            exec_duration = time.time() - cycle_start
+            with colab_lock:
+                cycle_start = time.time()
+                r_exec = run_cli_cmd(["colab", "exec", "-s", curr_session, "-f", script_file, "--timeout", str(PING_TIMEOUT)], timeout=75)
+                exec_duration = time.time() - cycle_start
 
             with status_lock:
                 relay_state["total_cycles"] = cycle
@@ -283,32 +322,10 @@ def run_backup_test():
     with status_lock:
         curr_session = relay_state["active_session"]
 
-    log(f"Running on-demand backup test on '{curr_session}'...")
-    test_code = """
-import os, time, subprocess
-
-canary_time = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
-with open('/content/workspace/canary.txt', 'w') as f:
-    f.write(f'Canary verification generated at {canary_time}\\n')
-
-print('Compressing /content/workspace...')
-cmd_tar = ['tar', '-czf', '/content/colab_bundle.tar.gz', '-C', '/content', 'workspace']
-r_tar = subprocess.run(cmd_tar, capture_output=True, text=True)
-print('Tar returncode:', r_tar.returncode)
-
-print('Uploading to Google Drive...')
-cmd_rclone = [
-    'rclone', 'copy', '/content/colab_bundle.tar.gz',
-    'gdrive:coolify-relay-state/colab-relay-state/',
-    '--drive-chunk-size=32M', '--buffer-size=32M'
-]
-r_rc = subprocess.run(cmd_rclone, capture_output=True, text=True)
-print('Rclone returncode:', r_rc.returncode, r_rc.stderr)
-"""
-    r = run_cli_cmd(["colab", "exec", "-s", curr_session, "--timeout", "120"], input_data=test_code)
-    log(f"Backup test completed with code {r.returncode}")
+    log(f"Received API request for on-demand backup on '{curr_session}'")
+    code, output = backup_session(curr_session)
     return {
         "session": curr_session,
-        "returncode": r.returncode,
-        "output": r.stdout.strip()
+        "returncode": code,
+        "output": output
     }
