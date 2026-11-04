@@ -272,7 +272,7 @@ def provision_session(session_name):
         r_tok = run_cli_cmd(["colab", "exec", "-s", session_name], input_data=f"with open('/content/tunnel_token.txt', 'w') as f: f.write('{tunnel_token}')\n")
 
     log("Hydrating services on new session...")
-    r_hyd = run_cli_cmd(["colab", "exec", "-s", session_name, "-f", hydrate, "--timeout", "180"], timeout=200)
+    r_hyd = run_cli_cmd(["colab", "exec", "-s", session_name, "-f", hydrate, "--timeout", "300"], timeout=320)
     log(f"Hydration exit code: {r_hyd.returncode}")
 
     return True
