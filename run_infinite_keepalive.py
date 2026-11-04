@@ -61,11 +61,16 @@ def main():
                 input=code,
                 text=True,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT
+                stderr=subprocess.STDOUT,
+                timeout=75
             )
             elapsed = time.time() - start
             out_summary = r.stdout.strip().replace("\n", " | ")[:120]
             log(f"[Cycle {cycle:04d}] {name} exit={r.returncode} in {elapsed:.1f}s | {out_summary}")
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - start
+            log(f"WARNING: Keepalive cycle {cycle:04d} timed out after {elapsed:.1f}s; cleaning hanging child processes...")
+            subprocess.run(["pkill", "-f", f"colab exec -s {SESSION_NAME}"], check=False)
         except Exception as e:
             elapsed = time.time() - start
             log(f"ERROR: Exception executing {name}: {e} in {elapsed:.1f}s")
