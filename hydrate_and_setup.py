@@ -23,10 +23,25 @@ if os.path.exists("/content/rclone.conf"):
     shutil.copy("/content/rclone.conf", "/root/.config/rclone/rclone.conf")
     os.chmod("/root/.config/rclone/rclone.conf", 0o600)
 
+rclone_b64 = os.environ.get("RCLONE_CONF_B64", "") or os.environ.get("RCLONE_CONFIG_BASE64", "")
+if rclone_b64 and not os.path.exists("/root/.config/rclone/rclone.conf"):
+    try:
+        import base64
+        with open("/root/.config/rclone/rclone.conf", "wb") as f:
+            f.write(base64.b64decode(rclone_b64))
+        os.chmod("/root/.config/rclone/rclone.conf", 0o600)
+        print("Configured rclone.conf from RCLONE_CONF_B64 environment variable.", flush=True)
+    except Exception as e:
+        print(f"Rclone config decode error: {e}", flush=True)
+
 if not shutil.which("rclone"):
     print("Installing rclone binary...", flush=True)
-    subprocess.run(["curl", "-fsSL", "https://rclone.org/install.sh", "-o", "/tmp/install_rclone.sh"], check=True)
-    subprocess.run(["bash", "/tmp/install_rclone.sh"], check=True)
+    if shutil.which("apt-get"):
+        subprocess.run(["apt-get", "update", "-qq"], check=False)
+        subprocess.run(["apt-get", "install", "-y", "-qq", "rclone"], check=False)
+    if not shutil.which("rclone"):
+        subprocess.run(["curl", "-fsSL", "https://rclone.org/install.sh", "-o", "/tmp/install_rclone.sh"], check=True)
+        subprocess.run(["bash", "/tmp/install_rclone.sh"], check=True)
 
 # Pull latest state bundle from central Google Drive if not local
 if not os.path.exists("/content/colab_bundle.tar.gz") and os.path.exists("/root/.config/rclone/rclone.conf"):
@@ -48,12 +63,40 @@ if os.path.exists("/content/colab_bundle.tar.gz"):
         print(f"Extraction note: {e}", flush=True)
 
 os.makedirs("/content/workspace", exist_ok=True)
-os.makedirs("/content/workspace/.claude_transcripts", exist_ok=True)
+transcripts_dir = "/content/workspace/.claude_transcripts"
+os.makedirs(transcripts_dir, exist_ok=True)
+
+# Migrate legacy root_claude if present in archive
+if os.path.exists("/content/root_claude") and os.path.isdir("/content/root_claude"):
+    for item in os.listdir("/content/root_claude"):
+        s = os.path.join("/content/root_claude", item)
+        d = os.path.join(transcripts_dir, item)
+        if not os.path.exists(d):
+            shutil.move(s, d)
+    shutil.rmtree("/content/root_claude", ignore_errors=True)
 
 # Point /root/.claude to persistent workspace directory so Claude chat history survives
-if os.path.islink("/root/.claude") or os.path.exists("/root/.claude"):
-    subprocess.run(["rm", "-rf", "/root/.claude"])
-subprocess.run(["ln", "-sf", "/content/workspace/.claude_transcripts", "/root/.claude"])
+root_claude = "/root/.claude"
+if os.path.exists(root_claude) and not os.path.islink(root_claude):
+    for item in os.listdir(root_claude):
+        s = os.path.join(root_claude, item)
+        d = os.path.join(transcripts_dir, item)
+        if not os.path.exists(d):
+            if os.path.isdir(s):
+                shutil.copytree(s, d)
+            else:
+                shutil.copy2(s, d)
+    shutil.rmtree(root_claude, ignore_errors=True)
+elif os.path.islink(root_claude):
+    os.unlink(root_claude)
+
+os.symlink(transcripts_dir, root_claude)
+
+# Ensure sync_state.sh is accessible at /content/workspace/sync_state.sh (Golden Rule 4)
+supervisor_sync = "/content/workspace/colab-relay-supervisor/sync_state.sh"
+workspace_sync = "/content/workspace/sync_state.sh"
+if os.path.exists(supervisor_sync) and not os.path.exists(workspace_sync):
+    os.symlink(supervisor_sync, workspace_sync)
 
 if os.path.exists("/content/workspace/.rclone/rclone.conf") and not os.path.exists("/root/.config/rclone/rclone.conf"):
     shutil.copy("/content/workspace/.rclone/rclone.conf", "/root/.config/rclone/rclone.conf")

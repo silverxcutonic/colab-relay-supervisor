@@ -26,32 +26,41 @@ if [ "$WORKSPACE_FILES" -eq 0 ]; then
   exit 0
 fi
 
-# 3. Packaging workspace and persistent claude history
-echo "[SYNC] Packaging /content/workspace and persistent chat sessions..."
-TARGETS_TO_PACK=()
-[ -d "$WORKSPACE_DIR" ] && TARGETS_TO_PACK+=("workspace")
-[ -d "$CLAUDE_DIR" ] && TARGETS_TO_PACK+=("root_claude")
+# 3. Ensure persistent claude transcripts are safely housed in workspace
+echo "[SYNC] Securing persistent chat sessions and memory..."
+PERSISTENT_CLAUDE="$WORKSPACE_DIR/.claude_transcripts"
+mkdir -p "$PERSISTENT_CLAUDE"
 
-# Create temporary symlink for root_claude if not packed from /content
+# If /root/.claude is a real directory and not yet symlinked, migrate its files
 if [ -d "$CLAUDE_DIR" ] && [ ! -L "$CLAUDE_DIR" ]; then
-  ln -sfn "$CLAUDE_DIR" "/content/root_claude"
+  cp -a "$CLAUDE_DIR"/. "$PERSISTENT_CLAUDE"/ 2>/dev/null || true
+  mv "$CLAUDE_DIR" "${CLAUDE_DIR}.bak" 2>/dev/null || true
+  ln -sfn "$PERSISTENT_CLAUDE" "$CLAUDE_DIR"
 fi
+
+# Ensure /root/.claude symlink exists
+if [ ! -e "$CLAUDE_DIR" ]; then
+  ln -sfn "$PERSISTENT_CLAUDE" "$CLAUDE_DIR"
+fi
+
+echo "[SYNC] Packaging /content/workspace (including persistent .claude_transcripts)..."
+TARGETS_TO_PACK=("workspace")
 
 TAR_EXCLUDES=(
   --exclude='workspace/.suwayomi_state/bin'
   --exclude='workspace/.suwayomi_state/cache'
+  --exclude='workspace/-config-workspace'
   --exclude='workspace/backups'
-  --exclude='workspace/Master_Backup_Bundle.zip'
-  --exclude='workspace/Core_Backup_Bundle.zip'
+  --exclude='workspace/*.zip'
+  --exclude='workspace/*.tar.gz'
+  --exclude='*.zip'
+  --exclude='*.tar.gz'
   --exclude='*.pyc'
   --exclude='__pycache__'
   --exclude='*.pytest_cache'
   --exclude='*.sock'
-  --exclude='workspace/amazon_loot_grabber/logs/*'
-  --exclude='workspace/Telegram_S3_Gateway_Bot/logs/*'
-  --exclude='workspace/Stream_Vault/logs/*'
-  --exclude='workspace/cai_tts_bundle/logs/*'
-  --exclude='workspace/code_server_bot/logs/*'
+  --exclude='*.log'
+  --exclude='workspace/*/logs/*'
   --exclude='workspace/manga_narrator_test/audio_cache/*'
   --exclude='workspace/*/cloudflared'
 )
@@ -66,6 +75,16 @@ ARCHIVE_SIZE=$(du -sh "$LOCAL_ARCHIVE" | cut -f1)
 echo "[SYNC] Archive created ($ARCHIVE_SIZE). Uploading to $STORAGE_TARGET/colab_bundle.tar.gz..."
 
 # 4. Upload to Google Drive with 32M buffer/chunk discipline
+if ! command -v rclone >/dev/null 2>&1; then
+  echo "[SYNC] Error: rclone is not installed. State bundle saved locally at $LOCAL_ARCHIVE."
+  exit 1
+fi
+
+if [ ! -f "/root/.config/rclone/rclone.conf" ] && [ ! -f "/content/rclone.conf" ] && [ -z "${RCLONE_CONFIG:-}" ]; then
+  echo "[SYNC] Error: No rclone.conf found. State bundle saved locally at $LOCAL_ARCHIVE."
+  exit 1
+fi
+
 rclone copyto "$LOCAL_ARCHIVE" "$STORAGE_TARGET/colab_bundle.tar.gz" \
   --drive-chunk-size=32M \
   --drive-upload-cutoff=32M \
@@ -75,4 +94,5 @@ rclone copyto "$LOCAL_ARCHIVE" "$STORAGE_TARGET/colab_bundle.tar.gz" \
   --retries=5 \
   --timeout=5m
 
+rm -f "$LOCAL_ARCHIVE"
 echo "[SYNC] Google Colab state backup completed successfully ($ARCHIVE_SIZE)."
