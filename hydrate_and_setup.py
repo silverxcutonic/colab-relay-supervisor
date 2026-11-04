@@ -114,6 +114,30 @@ if not os.path.exists(lsp_dir):
     subprocess.run(["rm", "-rf", "/tmp/openvscode.tar.gz", "/tmp/ovs_extract"])
     print(f"OpenVSCode installed cleanly to {lsp_dir}", flush=True)
 
+# Ensure Claude Code extension is installed in OpenVSCode
+ext_dir = "/root/.openvscode-server/extensions"
+os.makedirs(ext_dir, exist_ok=True)
+has_claude_ext = any("anthropic.claude-code" in p for p in glob.glob(f"{ext_dir}/*"))
+if not has_claude_ext:
+    print("Hydrating Claude Code extension...", flush=True)
+    if not os.path.exists("/content/claude_code_extension.tar.gz") and os.path.exists("/root/.config/rclone/rclone.conf"):
+        subprocess.run([
+            "rclone", "copy",
+            "gdrive:coolify-relay-state/colab-relay-state/claude_code_extension.tar.gz",
+            "/content/",
+            "--drive-chunk-size=32M",
+            "--buffer-size=32M"
+        ], check=False)
+    if os.path.exists("/content/claude_code_extension.tar.gz"):
+        try:
+            subprocess.run(["tar", "-xzf", "/content/claude_code_extension.tar.gz", "-C", "/root/.openvscode-server"], check=True)
+            print("Claude Code extension restored from cache bundle.", flush=True)
+        except Exception as e:
+            print(f"Extension extract note: {e}", flush=True)
+    else:
+        server_bin = f"{lsp_dir}/bin/openvscode-server"
+        subprocess.run([server_bin, "--install-extension", "anthropic.claude-code", "--force"], check=False)
+
 # Disguise internal node binary
 node_bin = f"{lsp_dir}/node"
 disguised_node = "/usr/local/bin/python3-lsp-node"
