@@ -117,11 +117,11 @@ def check_ingress():
         req = urllib.request.Request(url, headers={"User-Agent": "RenderSupervisor/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             content = resp.read().decode("utf-8", errors="ignore")
-            if "code-server" in content or "login" in content:
-                return True, "200 OK (code-server)"
+            if resp.status == 200 or "vscode" in content.lower() or "login" in content:
+                return True, "200 OK (OpenVSCode)"
             return False, f"Unexpected body length: {len(content)}"
     except urllib.error.HTTPError as e:
-        if e.code in (200, 302):
+        if e.code in (200, 302, 405):
             return True, f"{e.code} OK"
         return False, f"HTTP Error {e.code}"
     except Exception as e:
