@@ -101,6 +101,11 @@ def set_active_token(account_idx):
     if os.path.exists(tok_src):
         shutil.copyfile(tok_src, TOKEN_JSON)
         os.chmod(TOKEN_JSON, 0o600)
+        try:
+            from colab_cli.common import state
+            state._client = None
+        except Exception:
+            pass
         log(f"Active CLI token switched to Account [{account_idx+1}]")
         return True
     log(f"Warning: Token file {tok_src} not found.")
@@ -112,9 +117,13 @@ def check_ingress():
         req = urllib.request.Request(url, headers={"User-Agent": "RenderSupervisor/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             content = resp.read().decode("utf-8", errors="ignore")
-            if "code-server" in content:
+            if "code-server" in content or "login" in content:
                 return True, "200 OK (code-server)"
             return False, f"Unexpected body length: {len(content)}"
+    except urllib.error.HTTPError as e:
+        if e.code in (200, 302):
+            return True, f"{e.code} OK"
+        return False, f"HTTP Error {e.code}"
     except Exception as e:
         return False, str(e)
 
@@ -134,6 +143,7 @@ class PersistentKeepaliveClient:
     def __init__(self, session_name):
         self.session_name = session_name
         self.runtime = None
+        self.endpoint = None
         self._connected = False
 
     def connect(self):
@@ -143,6 +153,8 @@ class PersistentKeepaliveClient:
         s = state.get_session(self.session_name, ignore_missing_session=True)
         if not s:
             raise RuntimeError(f"Session '{self.session_name}' not found.")
+
+        self.endpoint = s.endpoint
 
         def on_started(kid):
             s.kernel_id = kid
@@ -164,7 +176,26 @@ class PersistentKeepaliveClient:
         # Access kernel_client property to start WebSocket in background thread
         _ = self.runtime.kernel_client
         self._connected = True
-        log(f"Persistent WebSocket attached to kernel on session '{self.session_name}'.")
+        log(f"Persistent WebSocket attached to kernel on session '{self.session_name}' (endpoint: {self.endpoint}).")
+
+    def ping_tfe(self):
+        """Pings Google Colab Tunnel Frontend (TFE) keep-alive endpoint.
+        Updates LastActiveTime on colab.research.google.com to prevent 11-min idle eviction."""
+        try:
+            from colab_cli.common import state
+            if not self.endpoint:
+                s = state.get_session(self.session_name, ignore_missing_session=True)
+                if s:
+                    self.endpoint = s.endpoint
+
+            if self.endpoint:
+                url = f"https://colab.research.google.com/tun/m/{self.endpoint}/keep-alive/?authuser=0"
+                headers = {"X-Colab-Tunnel": "Google"}
+                resp = state.client.session.get(url, headers=headers, timeout=15)
+                return resp.status_code
+        except Exception as e:
+            log(f"TFE keep-alive error: {e}")
+        return -1
 
     def execute(self, code, timeout=60):
         for attempt in range(2):
@@ -371,6 +402,7 @@ def supervisor_worker():
 
             with colab_lock:
                 cycle_start = time.time()
+                tfe_status = keepalive_client.ping_tfe()
                 try:
                     code_res, out_text = keepalive_client.execute(code_to_run, timeout=PING_TIMEOUT + 15)
                 except Exception as e:
@@ -380,11 +412,14 @@ def supervisor_worker():
             with status_lock:
                 relay_state["total_cycles"] = cycle
                 relay_state["last_cycle_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                relay_state["last_cycle_status"] = f"{script_name}: code {code_res} in {exec_duration:.1f}s"
+                relay_state["last_cycle_status"] = f"{script_name}: code {code_res} in {exec_duration:.1f}s | TFE: {tfe_status}"
 
-            if code_res != 0:
-                log(f"[{script_name}] Execution error ({code_res}): {out_text.strip()[:150]}")
-                if "not found" in out_text.lower() or "lost" in out_text.lower() or "error" in out_text.lower() or "404" in out_text or "401" in out_text:
+            if tfe_status != 200 and tfe_status != -1:
+                log(f"TFE keep-alive status ({tfe_status}) on endpoint '{keepalive_client.endpoint}'")
+
+            if code_res != 0 or tfe_status == 404:
+                log(f"[{script_name}] Execution error ({code_res}) | TFE status: {tfe_status}: {out_text.strip()[:150]}")
+                if tfe_status == 404 or "not found" in out_text.lower() or "lost" in out_text.lower() or "error" in out_text.lower() or "404" in out_text or "401" in out_text:
                     log(f"CRITICAL: Session '{curr_session}' unhealthy! Re-provisioning immediately...")
                     if keepalive_client:
                         keepalive_client.close()
