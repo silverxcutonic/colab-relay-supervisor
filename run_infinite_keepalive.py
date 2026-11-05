@@ -36,7 +36,9 @@ print("[PING-B] Finished duty cycle.", flush=True)
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def log(msg):
-    now = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    # Indian Standard Time (IST = UTC + 5:30)
+    ist_time = time.gmtime(time.time() + 19800)
+    now = time.strftime("%Y-%m-%d %I:%M:%S %p IST", ist_time)
     entry = f"[{now}] {msg}\n"
     sys.stdout.write(entry)
     sys.stdout.flush()

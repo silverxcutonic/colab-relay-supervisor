@@ -18,8 +18,10 @@ import threading
 import subprocess
 import collections
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 app = FastAPI(title="Colab Relay Supervisor 24/7")
 
@@ -81,7 +83,7 @@ print("[PING-B] Finished duty cycle.", flush=True)
 """
 
 def log(msg):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p IST")
     line = f"[{now}] [RENDER-SUPERVISOR] {msg}"
     print(line, flush=True)
     with status_lock:
@@ -383,7 +385,7 @@ def supervisor_worker():
 
             with status_lock:
                 relay_state["total_cycles"] = cycle
-                relay_state["last_cycle_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                relay_state["last_cycle_time"] = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p IST")
                 relay_state["last_cycle_status"] = f"code {code_res} in {exec_duration:.1f}s"
                 if success:
                     relay_state["consecutive_failures"] = 0
