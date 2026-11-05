@@ -13,7 +13,12 @@ import sys
 import glob
 import time
 import shutil
+import zipfile
 import subprocess
+
+# Guarantee /usr/local/bin is in PATH for rclone and helper binaries
+if "/usr/local/bin" not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = f"/usr/local/bin:/usr/bin:/bin:{os.environ.get('PATH', '')}"
 
 OPENVSCODE_RELEASE = "https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v1.109.5/openvscode-server-v1.109.5-linux-x64.tar.gz"
 
@@ -44,7 +49,7 @@ if rclone_b64 and not os.path.exists("/root/.config/rclone/rclone.conf"):
     except Exception as e:
         print(f"Rclone config decode error: {e}", flush=True)
 
-# Install standalone rclone binary (avoids apt-get locks & mandb hangs completely)
+# Install standalone rclone binary (avoids apt-get locks, mandb hangs, and external unzip dependency)
 if not shutil.which("rclone"):
     print("Installing fast standalone rclone binary...", flush=True)
     try:
@@ -52,16 +57,18 @@ if not shutil.which("rclone"):
             ["curl", "-fsSL", "https://downloads.rclone.org/rclone-current-linux-amd64.zip", "-o", "/tmp/rclone.zip"],
             check=True, timeout=40
         )
-        subprocess.run(
-            ["unzip", "-q", "-o", "/tmp/rclone.zip", "-d", "/tmp/rclone_unzip"],
-            check=True, timeout=20
-        )
+        os.makedirs("/tmp/rclone_unzip", exist_ok=True)
+        with zipfile.ZipFile("/tmp/rclone.zip", "r") as zf:
+            zf.extractall("/tmp/rclone_unzip")
         extracted = glob.glob("/tmp/rclone_unzip/*/rclone")
         if extracted:
+            os.makedirs("/usr/local/bin", exist_ok=True)
             shutil.copyfile(extracted[0], "/usr/local/bin/rclone")
-            subprocess.run(["chmod", "+x", "/usr/local/bin/rclone"], check=True)
+            os.chmod("/usr/local/bin/rclone", 0o755)
             print("Standalone rclone installed cleanly to /usr/local/bin/rclone", flush=True)
-        subprocess.run(["rm", "-rf", "/tmp/rclone.zip", "/tmp/rclone_unzip"], check=False)
+        shutil.rmtree("/tmp/rclone_unzip", ignore_errors=True)
+        if os.path.exists("/tmp/rclone.zip"):
+            os.unlink("/tmp/rclone.zip")
     except Exception as e:
         print(f"Standalone rclone install error: {e}", flush=True)
 
@@ -229,7 +236,7 @@ else:
     print("Launched OpenVSCode Server (detached process).", flush=True)
     time.sleep(2)
 
-print("=== [4/5] INSTALLING & STARTING DISGUISED CLOUDFLARE TUNNEL ===", flush=True)
+print("=== [4/6] INSTALLING & STARTING DISGUISED CLOUDFLARE TUNNEL ===", flush=True)
 bin_tunnel = "/usr/local/colab/bin/gdrive_sync_daemon"
 os.makedirs(os.path.dirname(bin_tunnel), exist_ok=True)
 if not os.path.exists(bin_tunnel):
@@ -280,7 +287,36 @@ else:
 
     time.sleep(2)
 
-print("=== [5/5] VERIFYING LOCAL READINESS ===", flush=True)
+print("=== [5/6] PROVISIONING IN-VM TELEGRAM BOT SUPERVISOR ===", flush=True)
+tg_bot_script = "/content/colab_tg_bot.py"
+def check_tg_bot_alive():
+    try:
+        r = subprocess.run(["pgrep", "-f", "colab_tg_bot.py"], capture_output=True, text=True)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+if os.path.exists(tg_bot_script):
+    if check_tg_bot_alive() and not FORCE_RESTORE:
+        print("=== [SAFE SKIP] TELEGRAM BOT SUPERVISOR ALREADY ACTIVE ===", flush=True)
+        print("Active in-VM Telegram supervisor preserved without restart.", flush=True)
+    else:
+        subprocess.run(["pkill", "-f", "colab_tg_bot.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open("/tmp/colab_tg_bot.log", "a") as log_tg:
+            subprocess.Popen(
+                [sys.executable, tg_bot_script],
+                stdout=log_tg,
+                stderr=log_tg,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True
+            )
+        print("In-VM Telegram Bot Supervisor launched successfully (detached process).", flush=True)
+        time.sleep(2)
+else:
+    print("Notice: /content/colab_tg_bot.py not found, skipping bot supervisor start.", flush=True)
+
+print("=== [6/6] VERIFYING LOCAL READINESS ===", flush=True)
 try:
     import urllib.request
     with urllib.request.urlopen("http://127.0.0.1:8443", timeout=5) as resp:

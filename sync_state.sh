@@ -5,6 +5,7 @@
 # Fast: Syncs in ~15 seconds with 32M chunk sizes to prevent GDrive API rate limits
 # ==============================================================================
 set -euo pipefail
+export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
 PRIMARY_STORAGE_TARGET="gdrive:coolify-relay-state/colab-relay-state"
 STORAGE_TARGET="${1:-${STORAGE_TARGET:-$PRIMARY_STORAGE_TARGET}}"
@@ -78,6 +79,12 @@ echo "[SYNC] Archive created ($ARCHIVE_SIZE). Uploading to $STORAGE_TARGET/colab
 if ! command -v rclone >/dev/null 2>&1; then
   echo "[SYNC] Error: rclone is not installed. State bundle saved locally at $LOCAL_ARCHIVE."
   exit 1
+fi
+
+if [ ! -f "/root/.config/rclone/rclone.conf" ] && [ -f "/content/rclone.conf" ]; then
+  mkdir -p /root/.config/rclone
+  cp /content/rclone.conf /root/.config/rclone/rclone.conf
+  chmod 600 /root/.config/rclone/rclone.conf
 fi
 
 if [ ! -f "/root/.config/rclone/rclone.conf" ] && [ ! -f "/content/rclone.conf" ] && [ -z "${RCLONE_CONFIG:-}" ]; then

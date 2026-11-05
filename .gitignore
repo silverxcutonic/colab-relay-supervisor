@@ -1,5 +1,11 @@
 __pycache__/
 *.pyc
 tokens/
+colab_pool/
+rclone.conf
+tunnel_token.txt
+tg_config.json
+node_info.json
+.env
 *.log
 .DS_Store
