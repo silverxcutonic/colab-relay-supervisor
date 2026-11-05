@@ -704,8 +704,8 @@ def on_startup():
     t.start()
 
 
-@app.get("/healthz")
-@app.get("/health")
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+@app.api_route("/health", methods=["GET", "HEAD"])
 def get_health():
     with status_lock:
         return {
@@ -727,13 +727,13 @@ def get_health():
         }
 
 
-@app.get("/status")
+@app.api_route("/status", methods=["GET", "HEAD"])
 def get_status():
     with status_lock:
         return dict(relay_state)
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def get_root(request: Request):
     accept = request.headers.get("accept", "")
     with status_lock:
@@ -786,7 +786,7 @@ def get_root(request: Request):
     return HTMLResponse(content=html)
 
 
-@app.get("/logs")
+@app.api_route("/logs", methods=["GET", "HEAD"])
 def get_logs():
     with status_lock:
         return list(log_history)
