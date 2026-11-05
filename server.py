@@ -224,20 +224,19 @@ def auto_adopt_or_provision():
 
 def execute_keepalive_pulse(session_name, cycle_num):
     """
-    Executes the validated 40-second active duty cycle via stdin.
-    Maintains the Jupyter kernel in BUSY state and keeps an interactive WebSocket open.
+    Executes the validated 40-second active duty cycle via physical file (-f).
+    Maintains the Jupyter kernel in BUSY state and avoids stdin piping issues under Uvicorn.
     """
-    script_name = "PING-A" if (cycle_num % 2 != 0) else "PING-B"
-    code = PING_CODE_A if (cycle_num % 2 != 0) else PING_CODE_B
+    script_name = "ping_a.py" if (cycle_num % 2 != 0) else "ping_b.py"
+    script_path = os.path.join(APP_DIR, script_name)
     start = time.time()
 
     try:
         r = subprocess.run(
-            [VENV_COLAB, "exec", "-s", session_name, "--timeout", str(int(CLI_TIMEOUT))],
-            input=code,
-            text=True,
+            [VENV_COLAB, "exec", "-s", session_name, "-f", script_path, "--timeout", str(int(CLI_TIMEOUT))],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            text=True,
             timeout=PROCESS_TIMEOUT
         )
         elapsed = time.time() - start

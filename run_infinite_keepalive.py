@@ -33,6 +33,8 @@ for i in range(8):
 print("[PING-B] Finished duty cycle.", flush=True)
 """
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 def log(msg):
     now = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     entry = f"[{now}] {msg}\n"
@@ -51,17 +53,16 @@ def main():
 
     while True:
         cycle += 1
-        name = "PING-A" if (cycle % 2 != 0) else "PING-B"
-        code = PING_CODE_A if (cycle % 2 != 0) else PING_CODE_B
+        name = "ping_a.py" if (cycle % 2 != 0) else "ping_b.py"
+        script_path = os.path.join(APP_DIR, name)
         start = time.time()
 
         try:
             r = subprocess.run(
-                [VENV_COLAB, "exec", "-s", SESSION_NAME, "--timeout", "70"],
-                input=code,
-                text=True,
+                [VENV_COLAB, "exec", "-s", SESSION_NAME, "-f", script_path, "--timeout", "70"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                text=True,
                 timeout=75
             )
             elapsed = time.time() - start
