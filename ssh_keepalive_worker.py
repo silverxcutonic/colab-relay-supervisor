@@ -139,6 +139,23 @@ def check_and_heal_services():
     except Exception:
         pass
 
+    # 3. Check In-VM Telegram Bot Supervisor
+    try:
+        r = subprocess.run(["pgrep", "-f", "colab_tg_bot.py"], capture_output=True)
+        if r.returncode != 0 and os.path.exists("/content/colab_tg_bot.py"):
+            with open("/tmp/colab_tg_bot.log", "a") as log_tg:
+                subprocess.Popen(
+                    [sys.executable, "/content/colab_tg_bot.py"],
+                    stdout=log_tg,
+                    stderr=log_tg,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            log_line("[HEAL] Restarted in-VM Telegram Bot Supervisor")
+    except Exception as e:
+        log_line(f"[HEAL-ERR] Telegram bot restart error: {e}")
+
 
 def main():
     ensure_single_instance()

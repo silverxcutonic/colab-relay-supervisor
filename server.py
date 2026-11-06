@@ -401,10 +401,12 @@ def get_tg_credentials():
 def generate_node_info(account_num, session_name):
     """Write node_info.json so in-VM colab_tg_bot.py knows the active account, session, and Telegram credentials."""
     tg_bot_token, tg_chat_id = get_tg_credentials()
+    shift_epoch = relay_state.get("shift_start_time", time.time())
     info = {
         "account": account_num,
         "email": ACCOUNTS.get(account_num, {}).get("email", f"Account {account_num}"),
         "session": session_name,
+        "shift_start_epoch": shift_epoch,
         "start_time_ist": get_ist_str(),
         "target_hours": 8,
         "tg_bot_token": tg_bot_token,
@@ -419,7 +421,7 @@ def generate_node_info(account_num, session_name):
 
 
 def upload_all_scripts(session_name):
-    """Upload all 9 operational scripts and configs to /content/ on the active Colab VM."""
+    """Upload all operational scripts and configs to /content/ on the active Colab VM."""
     log(f"Uploading operational scripts & configs to '{session_name}':/content/...")
     files_to_upload = [
         ("ping_a.py", "/content/ping_a.py"),
@@ -432,6 +434,7 @@ def upload_all_scripts(session_name):
         ("execute_backup.py", "/content/execute_backup.py"),
         ("colab_tg_bot.py", "/content/colab_tg_bot.py"),
         ("node_info.json", "/content/node_info.json"),
+        ("tg_config.json", "/content/tg_config.json"),
     ]
     all_ok = True
     for fname, dst in files_to_upload:

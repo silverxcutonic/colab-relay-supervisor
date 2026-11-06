@@ -233,31 +233,59 @@ def run_monitor_loop(account_num, session_name):
     email = ACCOUNTS.get(account_num, f"Account {account_num}")
     log(f"Starting Colab In-VM Supervisor: Account {account_num} ({email}), Session: {session_name}")
 
-    raw_uptime = get_uptime_seconds()
-    shift_anchor_file = "/content/.shift_start_uptime"
-    if os.path.exists(shift_anchor_file):
+    # Determine shift start epoch timestamp
+    shift_epoch = None
+    epoch_file = "/content/.shift_start_epoch"
+    if os.path.exists(epoch_file):
         try:
-            with open(shift_anchor_file, "r") as af:
-                shift_start_uptime = float(af.read().strip())
+            with open(epoch_file, "r") as f:
+                shift_epoch = float(f.read().strip())
         except Exception:
-            shift_start_uptime = raw_uptime
-    else:
-        shift_start_uptime = raw_uptime
+            pass
+    if shift_epoch is None and os.path.exists(NODE_INFO_FILE):
         try:
-            with open(shift_anchor_file, "w") as af:
-                af.write(str(shift_start_uptime))
+            with open(NODE_INFO_FILE, "r") as f:
+                info = json.load(f)
+                if "shift_start_epoch" in info:
+                    shift_epoch = float(info["shift_start_epoch"])
         except Exception:
             pass
 
-    initial_uptime = max(0.0, raw_uptime - shift_start_uptime)
+    if shift_epoch is None:
+        # Fallback to shift start uptime anchor
+        raw_uptime = get_uptime_seconds()
+        shift_anchor_file = "/content/.shift_start_uptime"
+        if os.path.exists(shift_anchor_file):
+            try:
+                with open(shift_anchor_file, "r") as af:
+                    shift_start_uptime = float(af.read().strip())
+            except Exception:
+                shift_start_uptime = raw_uptime
+        else:
+            shift_start_uptime = raw_uptime
+            try:
+                with open(shift_anchor_file, "w") as af:
+                    af.write(str(shift_start_uptime))
+            except Exception:
+                pass
+        shift_epoch = time.time() - max(0.0, raw_uptime - shift_start_uptime)
+        try:
+            with open(epoch_file, "w") as f:
+                f.write(str(shift_epoch))
+        except Exception:
+            pass
+
+    current_elapsed = max(0.0, time.time() - shift_epoch)
+    raw_uptime = get_uptime_seconds()
+
     startup_msg = (
-        f"🚀 *Colab Relay Node Online!* (Shift Started)\n\n"
+        f"🚀 *Colab Relay Node Online!* (Shift Active)\n\n"
         f"👤 *Account:* Account {account_num} (`{email}`)\n"
         f"📦 *Session:* `{session_name}`\n"
         f"🌐 *Web IDE:* https://colab.silver-xf.bond\n"
-        f"⏱️ *Shift Elapsed:* `{format_duration(initial_uptime)}` (VM Uptime: `{format_duration(raw_uptime)}`)\n"
+        f"⏱️ *Shift Elapsed:* `{format_duration(current_elapsed)}` (VM Uptime: `{format_duration(raw_uptime)}`)\n"
         f"🎯 *Shift Target:* 8 Hours (Continuous)\n"
-        f"🕒 *Started At:* `{get_ist_str()}`\n\n"
+        f"🕒 *Current Time:* `{get_ist_str()}`\n\n"
         f"💡 *Mobile Fail-Safe:* Tap the button below anytime to checkpoint your workspace to Google Drive."
     )
     send_message(startup_msg, reply_markup=get_backup_keyboard())
@@ -274,18 +302,42 @@ def run_monitor_loop(account_num, session_name):
         28800: ("0m_end", False)     # 8h 00m
     }
 
-    # Mark milestones that have already elapsed in case of late bootstrap
-    for threshold in milestones:
-        if initial_uptime >= threshold:
-            milestones[threshold] = (milestones[threshold][0], True)
+    # Catch-up check: If 2h milestone has passed and was never sent, send it immediately
+    for threshold, (label, _) in list(milestones.items()):
+        flag_file = f"/content/.milestone_{threshold}_sent"
+        if os.path.exists(flag_file):
+            milestones[threshold] = (label, True)
+        elif current_elapsed >= threshold and threshold <= 21600:
+            # Milestone has passed but never notified; dispatch catch-up alert
+            milestones[threshold] = (label, True)
+            try:
+                with open(flag_file, "w") as f:
+                    f.write(str(time.time()))
+            except Exception:
+                pass
+            rem = max(0, SHIFT_DURATION - current_elapsed)
+            send_message(
+                f"⏱️ *Colab Shift Checkpoint: {label.upper()} / 8h (Live Status)*\n\n"
+                f"👤 *Account:* Account {account_num} (`{email}`)\n"
+                f"📈 *Shift Elapsed:* `{format_duration(current_elapsed)}`\n"
+                f"⏳ *Time Remaining:* `{format_duration(rem)}`\n"
+                f"🌐 *Web IDE:* https://colab.silver-xf.bond\n"
+                f"🟢 *Status:* Healthy & Locked in Keepalive",
+                reply_markup=get_backup_keyboard()
+            )
 
     while True:
-        uptime = max(0.0, get_uptime_seconds() - shift_start_uptime)
+        uptime = max(0.0, time.time() - shift_epoch)
         remaining = max(0, SHIFT_DURATION - uptime)
 
         # 2-Hour Checkpoint
         if uptime >= 7200 and not milestones[7200][1]:
             milestones[7200] = ("2h", True)
+            try:
+                with open("/content/.milestone_7200_sent", "w") as f:
+                    f.write(str(time.time()))
+            except Exception:
+                pass
             send_message(
                 f"⏱️ *Colab Shift Checkpoint: 2h / 8h*\n\n"
                 f"👤 *Account:* Account {account_num} (`{email}`)\n"
