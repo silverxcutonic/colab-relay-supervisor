@@ -245,8 +245,9 @@ def exec_command(
                     recovered = True
                 else:
                     typer.echo(
-                        f"[colab] Session '{name}' not found in backend assignments ({len(by_endpoint)} active); retaining session entry for retry."
+                        f"[colab] Session '{name}' no longer assigned on backend. Cleaning up."
                     )
+                    state.prune_session(name)
                     raise typer.Exit(1)
             except typer.Exit:
                 raise
@@ -380,8 +381,9 @@ def repl(
                     recovered = True
                 else:
                     typer.echo(
-                        f"[colab] Session '{name}' not found in backend assignments ({len(by_endpoint)} active); retaining session entry for retry."
+                        f"[colab] Session '{name}' no longer assigned on backend. Cleaning up."
                     )
+                    state.prune_session(name)
                     raise typer.Exit(1)
             except typer.Exit:
                 raise

@@ -615,16 +615,11 @@ def execute_keepalive_pulse(session_name, cycle_num):
         timeout=PROCESS_TIMEOUT
     )
     elapsed = time.time() - start
+    out_summary = out.replace("\n", " | ")[:140]
     success = (code == 0)
 
     if code == -1 and os.name != "nt":
         subprocess.run(["pkill", "-f", f"colab_cli.cli exec -s {session_name}"], check=False)
-
-    if success:
-        out_summary = out.replace("\n", " | ")[:140]
-    else:
-        clean_out = out.replace("\n", " | ").strip()
-        out_summary = clean_out[-250:] if len(clean_out) > 250 else clean_out
 
     log(f"[Cycle {cycle_num:04d}] {script_name} exit={code} in {elapsed:.1f}s | {out_summary}")
     return success, code, elapsed, out_summary
@@ -681,13 +676,12 @@ def supervisor_worker():
                 relay_state["shift_elapsed_seconds"] = int(elapsed)
                 relay_state["shift_remaining_seconds"] = int(remaining)
 
-            # === HOT HANDOVER SEQUENCE AT 7h 55m (28,500s) OR 5m BEFORE SHIFT END ===
-            handover_threshold = min(HANDOVER_THRESHOLD_SECONDS, max(60.0, duration - 300.0))
-            if elapsed >= handover_threshold:
+            # === HOT HANDOVER SEQUENCE AT 7h 55m (28,500s) ===
+            if elapsed >= HANDOVER_THRESHOLD_SECONDS:
                 next_idx = (curr_idx + 1) % 3
                 next_acc_num = next_idx + 1
                 next_session = f"colab-prod-node{next_acc_num}"
-                log(f"=== INITIATING SHIFT HANDOVER: Account {curr_idx+1} -> Account {next_acc_num} (elapsed {int(elapsed)}s >= threshold {int(handover_threshold)}s) ===")
+                log(f"=== INITIATING 8-HOUR SHIFT HANDOVER: Account {curr_idx+1} -> Account {next_acc_num} ===")
 
                 with colab_lock:
                     # 1. Final Google Drive state backup on current node
@@ -746,37 +740,11 @@ def supervisor_worker():
 
             # Auto-remediation if 3 consecutive keepalive pulses fail
             if relay_state["consecutive_failures"] >= 3:
-                log(f"CRITICAL: {relay_state['consecutive_failures']} consecutive keepalive failures on '{curr_session}'! Triggering self-healing...")
+                log(f"CRITICAL: 3 consecutive keepalive failures on '{curr_session}'! Triggering self-healing...")
                 with colab_lock:
-                    remediated = provision_session(curr_idx, curr_session)
-                    if remediated:
-                        log(f"Self-healing successfully re-established '{curr_session}' on Account {curr_idx+1}.")
-                        with status_lock:
-                            relay_state["consecutive_failures"] = 0
-                    else:
-                        # Current account failed to recover (exhaustion / quota / backend down)
-                        # Auto-failover to the next account in the 3-account ring
-                        next_idx = (curr_idx + 1) % 3
-                        next_acc_num = next_idx + 1
-                        next_session = f"colab-prod-node{next_acc_num}"
-                        log(f"ALERT: Self-healing on Account {curr_idx+1} failed! Auto-failing over to Account {next_acc_num} ({next_session})...")
-                        if provision_session(next_idx, next_session):
-                            ep = get_current_endpoint(next_session) or "ACTIVE"
-                            with status_lock:
-                                relay_state["active_account_index"] = next_idx
-                                relay_state["active_account_num"] = next_acc_num
-                                relay_state["active_account_email"] = ACCOUNTS[next_acc_num]["email"]
-                                relay_state["active_session"] = next_session
-                                relay_state["active_endpoint"] = ep
-                                relay_state["shift_start_time"] = time.time()
-                                relay_state["shift_start_ist"] = get_ist_str()
-                                relay_state["shift_duration_seconds"] = DEFAULT_SHIFT_SECONDS
-                                relay_state["consecutive_failures"] = 0
-                            curr_idx = next_idx
-                            curr_session = next_session
-                            log(f"=== AUTO-FAILOVER SUCCESS: Account {next_acc_num} ({ACCOUNTS[next_acc_num]['email']}) is now active ===")
-                        else:
-                            log(f"WARNING: Failover to Account {next_acc_num} also failed; will retry next pulse.")
+                    provision_session(curr_idx, curr_session)
+                    with status_lock:
+                        relay_state["consecutive_failures"] = 0
 
             # Probe public Web IDE ingress every 2 cycles
             if cycle % 2 == 0:
