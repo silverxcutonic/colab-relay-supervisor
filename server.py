@@ -688,26 +688,11 @@ def provision_session(account_idx, session_name):
 def _sync_adopted_shift_epoch(session_name):
     """Preserve true shift start time when adopting an already-running Colab VM."""
     remote_cmd = (
-        "python3 -c \""
-        "import os, time; "
-        "ep = None; "
-        "ep_f = '/content/.shift_start_epoch'; "
-        "up_f = '/proc/uptime'; "
-        "now = time.time(); "
-        "if os.path.exists(ep_f): "
-        "  try: ep = float(open(ep_f).read().strip()); "
-        "  except: pass; "
-        "if ep is None and os.path.exists(up_f): "
-        "  try: ep = now - float(open(up_f).read().split()[0]); "
-        "  except: pass; "
-        "if ep is not None: "
-        "  print('SHIFT_EPOCH:' + str(ep)); "
-        "  open('/content/.tg_startup_sent', 'a').close(); "
-        "  elapsed = now - ep; "
-        "  if elapsed >= 7200: open('/content/.milestone_7200_sent', 'a').close(); "
-        "  if elapsed >= 14400: open('/content/.milestone_14400_sent', 'a').close(); "
-        "  if elapsed >= 21600: open('/content/.milestone_21600_sent', 'a').close(); "
-        "\""
+        "if [ -f /content/.shift_start_epoch ]; then "
+        "echo SHIFT_EPOCH:$(cat /content/.shift_start_epoch); "
+        "elif [ -f /proc/uptime ]; then "
+        "echo SHIFT_EPOCH:$(python3 -c 'import time; print(time.time() - float(open(\"/proc/uptime\").read().split()[0]))'); "
+        "fi"
     )
     code, out = run_colab(["ssh", "-s", session_name, "-c", remote_cmd], timeout=35)
     if code == 0 and "SHIFT_EPOCH:" in out:
@@ -1134,6 +1119,25 @@ def get_root(request: Request):
 def get_logs():
     with status_lock:
         return list(log_history)
+
+
+@app.post("/sync-clock")
+def trigger_clock_sync():
+    """Manual or automated trigger to re-sync shift clock from running VM."""
+    with status_lock:
+        curr_session = relay_state["active_session"]
+    with colab_lock:
+        ep = _sync_adopted_shift_epoch(curr_session)
+    with status_lock:
+        return {
+            "status": "clock_synced",
+            "session": curr_session,
+            "shift_start_epoch": ep,
+            "shift_start_ist": relay_state.get("shift_start_ist"),
+            "shift_elapsed_seconds": relay_state.get("shift_elapsed_seconds"),
+            "shift_remaining_seconds": relay_state.get("shift_remaining_seconds"),
+            "time_ist": get_ist_str()
+        }
 
 
 @app.post("/rotate")
