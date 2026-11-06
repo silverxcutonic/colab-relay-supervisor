@@ -278,43 +278,53 @@ def run_monitor_loop(account_num, session_name):
     current_elapsed = max(0.0, time.time() - shift_epoch)
     raw_uptime = get_uptime_seconds()
 
-    startup_msg = (
-        f"🚀 *Colab Relay Node Online!* (Shift Active)\n\n"
-        f"👤 *Account:* Account {account_num} (`{email}`)\n"
-        f"📦 *Session:* `{session_name}`\n"
-        f"🌐 *Web IDE:* https://colab.silver-xf.bond\n"
-        f"⏱️ *Shift Elapsed:* `{format_duration(current_elapsed)}` (VM Uptime: `{format_duration(raw_uptime)}`)\n"
-        f"🎯 *Shift Target:* 8 Hours (Continuous)\n"
-        f"🕒 *Current Time:* `{get_ist_str()}`\n\n"
-        f"💡 *Mobile Fail-Safe:* Tap the button below anytime to checkpoint your workspace to Google Drive."
-    )
-    send_message(startup_msg, reply_markup=get_backup_keyboard())
+    startup_flag = "/content/.tg_startup_sent"
+    if not os.path.exists(startup_flag):
+        startup_msg = (
+            f"🚀 *Colab Relay Node Online!* (Shift Active)\n\n"
+            f"👤 *Account:* Account {account_num} (`{email}`)\n"
+            f"📦 *Session:* `{session_name}`\n"
+            f"🌐 *Web IDE:* https://colab.silver-xf.bond\n"
+            f"⏱️ *Shift Elapsed:* `{format_duration(current_elapsed)}` (VM Uptime: `{format_duration(raw_uptime)}`)\n"
+            f"🎯 *Shift Target:* 8 Hours (Continuous)\n"
+            f"🕒 *Current Time:* `{get_ist_str()}`\n\n"
+            f"💡 *Mobile Fail-Safe:* Tap the button below anytime to checkpoint your workspace to Google Drive."
+        )
+        if send_message(startup_msg, reply_markup=get_backup_keyboard()):
+            try:
+                with open(startup_flag, "w") as sf:
+                    sf.write(str(time.time()))
+            except Exception:
+                pass
 
-    # Alert milestones (elapsed seconds since shift start)
+    # Alert milestones (elapsed seconds since shift start, aligned with 7h55m handover)
     milestones = {
         7200: ("2h", False),
         14400: ("4h", False),
         21600: ("6h", False),
         27000: ("30m_left", False),  # 7h 30m
         28200: ("10m_left", False),  # 7h 50m
-        28500: ("5m_left", False),   # 7h 55m
-        28680: ("2m_left", False),   # 7h 58m
-        28800: ("0m_end", False)     # 8h 00m
+        28320: ("5m_left", False),   # 7h 52m (3m before 7h55m handover)
+        28410: ("2m_left", False),   # 7h 53m 30s (90s before 7h55m handover)
+        28490: ("0m_end", False)     # 7h 54m 50s (10s before 7h55m handover)
     }
 
-    # Catch-up check: If 2h milestone has passed and was never sent, send it immediately
+    def mark_milestone_sent(threshold, label):
+        milestones[threshold] = (label, True)
+        try:
+            with open(f"/content/.milestone_{threshold}_sent", "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+
+    # Catch-up check: If any 2h/4h/6h milestone has passed and was never sent, send it immediately
     for threshold, (label, _) in list(milestones.items()):
         flag_file = f"/content/.milestone_{threshold}_sent"
         if os.path.exists(flag_file):
             milestones[threshold] = (label, True)
         elif current_elapsed >= threshold and threshold <= 21600:
             # Milestone has passed but never notified; dispatch catch-up alert
-            milestones[threshold] = (label, True)
-            try:
-                with open(flag_file, "w") as f:
-                    f.write(str(time.time()))
-            except Exception:
-                pass
+            mark_milestone_sent(threshold, label)
             rem = max(0, SHIFT_DURATION - current_elapsed)
             send_message(
                 f"⏱️ *Colab Shift Checkpoint: {label.upper()} / 8h (Live Status)*\n\n"
@@ -325,6 +335,9 @@ def run_monitor_loop(account_num, session_name):
                 f"🟢 *Status:* Healthy & Locked in Keepalive",
                 reply_markup=get_backup_keyboard()
             )
+        elif current_elapsed >= threshold and threshold > 21600:
+            # Suppress expired end-of-shift warnings on late restart
+            mark_milestone_sent(threshold, label)
 
     while True:
         uptime = max(0.0, time.time() - shift_epoch)
@@ -332,12 +345,7 @@ def run_monitor_loop(account_num, session_name):
 
         # 2-Hour Checkpoint
         if uptime >= 7200 and not milestones[7200][1]:
-            milestones[7200] = ("2h", True)
-            try:
-                with open("/content/.milestone_7200_sent", "w") as f:
-                    f.write(str(time.time()))
-            except Exception:
-                pass
+            mark_milestone_sent(7200, "2h")
             send_message(
                 f"⏱️ *Colab Shift Checkpoint: 2h / 8h*\n\n"
                 f"👤 *Account:* Account {account_num} (`{email}`)\n"
@@ -350,7 +358,7 @@ def run_monitor_loop(account_num, session_name):
 
         # 4-Hour Checkpoint
         if uptime >= 14400 and not milestones[14400][1]:
-            milestones[14400] = ("4h", True)
+            mark_milestone_sent(14400, "4h")
             send_message(
                 f"⏱️ *Colab Shift Checkpoint: 4h / 8h (Halfway!)*\n\n"
                 f"👤 *Account:* Account {account_num} (`{email}`)\n"
@@ -363,7 +371,7 @@ def run_monitor_loop(account_num, session_name):
 
         # 6-Hour Checkpoint
         if uptime >= 21600 and not milestones[21600][1]:
-            milestones[21600] = ("6h", True)
+            mark_milestone_sent(21600, "6h")
             send_message(
                 f"⏱️ *Colab Shift Checkpoint: 6h / 8h*\n\n"
                 f"👤 *Account:* Account {account_num} (`{email}`)\n"
@@ -376,7 +384,7 @@ def run_monitor_loop(account_num, session_name):
 
         # T-30m Warning
         if uptime >= 27000 and not milestones[27000][1]:
-            milestones[27000] = ("30m_left", True)
+            mark_milestone_sent(27000, "30m_left")
             send_message(
                 f"⚠️ *Colab Handover Warning: 30 Minutes Remaining!*\n\n"
                 f"👤 *Account:* Account {account_num} (`{email}`)\n"
@@ -387,7 +395,7 @@ def run_monitor_loop(account_num, session_name):
 
         # T-10m Warning
         if uptime >= 28200 and not milestones[28200][1]:
-            milestones[28200] = ("10m_left", True)
+            mark_milestone_sent(28200, "10m_left")
             send_message(
                 f"⚠️ *Colab Handover Warning: 10 Minutes Remaining!*\n\n"
                 f"👤 *Account:* Account {account_num} (`{email}`)\n"
@@ -397,8 +405,8 @@ def run_monitor_loop(account_num, session_name):
             )
 
         # T-5m Warning
-        if uptime >= 28500 and not milestones[28500][1]:
-            milestones[28500] = ("5m_left", True)
+        if uptime >= 28320 and not milestones[28320][1]:
+            mark_milestone_sent(28320, "5m_left")
             send_message(
                 f"⚠️ *Colab Handover Alert: 5 Minutes Remaining!*\n\n"
                 f"👤 *Account:* Account {account_num} (`{email}`)\n"
@@ -408,8 +416,8 @@ def run_monitor_loop(account_num, session_name):
             )
 
         # T-2m Red Alert
-        if uptime >= 28680 and not milestones[28680][1]:
-            milestones[28680] = ("2m_left", True)
+        if uptime >= 28410 and not milestones[28410][1]:
+            mark_milestone_sent(28410, "2m_left")
             send_message(
                 f"🚨 *RED ALERT: 2 MINUTES REMAINING!* 🚨\n\n"
                 f"👤 *Account:* Account {account_num} (`{email}`)\n"
@@ -419,8 +427,8 @@ def run_monitor_loop(account_num, session_name):
             )
 
         # T-0m Handover Freeze & Backup
-        if uptime >= 28800 and not milestones[28800][1]:
-            milestones[28800] = ("0m_end", True)
+        if uptime >= 28490 and not milestones[28490][1]:
+            mark_milestone_sent(28490, "0m_end")
             send_message(
                 f"📦 *Colab 8-Hour Shift Complete! (T-0 reached)*\n\n"
                 f"👤 *Account:* Account {account_num} (`{email}`)\n"
@@ -439,8 +447,7 @@ def run_monitor_loop(account_num, session_name):
                     f"❌ *Final Shift Backup Warning:* {msg}\n"
                     f"🕒 *Time:* `{get_ist_str()}`"
                 )
-            log("8-Hour shift concluded and final backup completed.")
-            break
+            log("8-Hour shift concluded and final backup completed. Remaining idle until VM stop.")
 
         time.sleep(10)
 

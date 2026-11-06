@@ -60,10 +60,10 @@ log_history = collections.deque(maxlen=250)
 
 relay_state = {
     "status": "INITIALIZING",
-    "active_account_index": 1,
-    "active_account_num": 2,
-    "active_account_email": ACCOUNTS[2]["email"],
-    "active_session": "colab-prod-node2",
+    "active_account_index": 0,
+    "active_account_num": 1,
+    "active_account_email": ACCOUNTS[1]["email"],
+    "active_session": "colab-prod-node1",
     "active_endpoint": "UNKNOWN",
     "shift_start_time": time.time(),
     "shift_start_ist": "",
@@ -636,8 +636,11 @@ def provision_session(account_idx, session_name):
     if not is_active:
         if not _allocate_fresh_session(account_idx, session_name):
             return False
+        with status_lock:
+            relay_state["shift_start_time"] = time.time()
     else:
         log(f"Session '{session_name}' is already active on Account {acc_num}.")
+        _sync_adopted_shift_epoch(session_name)
 
     generate_node_info(acc_num, session_name)
     upload_ok = upload_all_scripts(session_name)
@@ -670,15 +673,39 @@ def provision_session(account_idx, session_name):
     return True
 
 
+def _sync_adopted_shift_epoch(session_name):
+    """Preserve true shift start time when adopting an already-running Colab VM."""
+    probe = (
+        "import os, time\n"
+        "if os.path.exists('/content/.shift_start_epoch'):\n"
+        "    print('SHIFT_EPOCH:' + open('/content/.shift_start_epoch').read().strip())\n"
+        "elif os.path.exists('/proc/uptime'):\n"
+        "    up = float(open('/proc/uptime').read().split()[0])\n"
+        "    print('SHIFT_EPOCH:' + str(time.time() - up))\n"
+    )
+    code, out = run_colab(["exec", "-s", session_name, "-c", probe, "--timeout", "20"], timeout=25)
+    if code == 0 and "SHIFT_EPOCH:" in out:
+        try:
+            ep_val = float(out.split("SHIFT_EPOCH:")[-1].splitlines()[0].strip())
+            if 0 < (time.time() - ep_val) < DEFAULT_SHIFT_SECONDS:
+                with status_lock:
+                    relay_state["shift_start_time"] = ep_val
+                log(f"Synchronized adopted VM shift clock: {(time.time() - ep_val)/3600:.2f}h elapsed.")
+                return ep_val
+        except Exception:
+            pass
+    return time.time()
+
+
 def auto_adopt_or_provision():
     """
     Auto-adopt any currently live Colab VM across the 3 accounts on startup.
     Verifies that adopted sessions actually pass script upload + hydration + SSH nohup setup;
     if an assignment is stale/unreachable, cleans it up and continues across the 3-account pool.
     """
-    start_acc_env = int(os.environ.get("STARTING_ACCOUNT", "2"))
+    start_acc_env = int(os.environ.get("STARTING_ACCOUNT", "1"))
     if start_acc_env not in (1, 2, 3):
-        start_acc_env = 2
+        start_acc_env = 1
 
     # 1. Check all 3 accounts for an existing live assignment starting from STARTING_ACCOUNT
     search_order = [(start_acc_env - 1 + i) % 3 for i in range(3)]
@@ -710,6 +737,7 @@ def auto_adopt_or_provision():
                 )
                 state.store.add(s)
                 log(f"=== AUTO-ADOPTED running assignment '{a.endpoint}' on Account {acc_num} as '{session_name}' ===")
+                _sync_adopted_shift_epoch(session_name)
                 generate_node_info(acc_num, session_name)
                 if upload_all_scripts(session_name) and hydrate_session(session_name, force=False):
                     ensure_ssh_nohup_worker(session_name)
@@ -845,7 +873,8 @@ def supervisor_worker():
         relay_state["active_account_email"] = ACCOUNTS[acc_num]["email"]
         relay_state["active_session"] = curr_session
         relay_state["active_endpoint"] = endpoint
-        relay_state["shift_start_time"] = time.time()
+        if not relay_state.get("shift_start_time"):
+            relay_state["shift_start_time"] = time.time()
         relay_state["shift_start_ist"] = get_ist_str()
 
     cycle = 0
@@ -936,6 +965,8 @@ def supervisor_worker():
                             relay_state["consecutive_failures"] = 0
                     else:
                         log(f"WARNING: Self-healing on Account {curr_idx+1} failed (possible ~6h eviction / quota cooldown). Initiating automatic failover...")
+                        set_active_token(curr_idx)
+                        run_colab(["stop", "-s", curr_session], timeout=30)
                         for offset in (1, 2):
                             cand_idx = (curr_idx + offset) % 3
                             cand_acc_num = cand_idx + 1

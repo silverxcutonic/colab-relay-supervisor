@@ -17,13 +17,25 @@ LOCAL_ARCHIVE="$STAGE_DIR/colab_bundle.tar.gz"
 echo "[SYNC] === Initiating Google Colab State & Chat Backup ==="
 mkdir -p "$STAGE_DIR"
 
+# Prevent concurrent backup collisions between supervisor and Telegram bot
+LOCK_FILE="/tmp/colab_sync_state.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "[SYNC] Another backup is already in progress. Skipping duplicate invocation."
+  exit 0
+fi
+
 # 1. Clean scratch / cache files before packing
 find "$WORKSPACE_DIR" -type d \( -name "__pycache__" -o -name ".pytest_cache" \) -prune -exec rm -rf {} + 2>/dev/null || true
 
-# 2. Guard: Never overwrite cloud state with an empty workspace
-WORKSPACE_FILES=$(find "$WORKSPACE_DIR" -mindepth 1 2>/dev/null | wc -l || echo 0)
-if [ "$WORKSPACE_FILES" -eq 0 ]; then
-  echo "[SYNC] Guard Triggered: Workspace is empty. Skipping upload to protect remote state."
+# 2. Guard: Never overwrite cloud state with an empty or unhydrated skeleton workspace
+REAL_USER_FILES=$(find "$WORKSPACE_DIR" -mindepth 1 -maxdepth 2 \
+  ! -path "$WORKSPACE_DIR/.claude_transcripts" \
+  ! -path "$WORKSPACE_DIR/sync_state.sh" \
+  ! -path "$WORKSPACE_DIR/colab-relay-supervisor*" \
+  ! -path "$WORKSPACE_DIR/.rclone*" 2>/dev/null | wc -l || echo 0)
+if [ "$REAL_USER_FILES" -eq 0 ]; then
+  echo "[SYNC] Guard Triggered: Workspace has no real user files or transcripts ($REAL_USER_FILES found). Skipping upload to protect remote state."
   exit 0
 fi
 
@@ -35,12 +47,13 @@ mkdir -p "$PERSISTENT_CLAUDE"
 # If /root/.claude is a real directory and not yet symlinked, migrate its files
 if [ -d "$CLAUDE_DIR" ] && [ ! -L "$CLAUDE_DIR" ]; then
   cp -a "$CLAUDE_DIR"/. "$PERSISTENT_CLAUDE"/ 2>/dev/null || true
-  mv "$CLAUDE_DIR" "${CLAUDE_DIR}.bak" 2>/dev/null || true
+  rm -rf "$CLAUDE_DIR" 2>/dev/null || true
   ln -sfn "$PERSISTENT_CLAUDE" "$CLAUDE_DIR"
 fi
 
 # Ensure /root/.claude symlink exists
-if [ ! -e "$CLAUDE_DIR" ]; then
+if [ ! -L "$CLAUDE_DIR" ]; then
+  rm -rf "$CLAUDE_DIR" 2>/dev/null || true
   ln -sfn "$PERSISTENT_CLAUDE" "$CLAUDE_DIR"
 fi
 

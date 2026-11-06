@@ -109,6 +109,7 @@ else:
     if os.path.exists("/content/colab_bundle.tar.gz"):
         try:
             subprocess.run(["tar", "-xzf", "/content/colab_bundle.tar.gz", "-C", "/content"], check=True, timeout=30)
+            os.unlink("/content/colab_bundle.tar.gz")
             print("Workspace archive unpacked successfully.", flush=True)
         except Exception as e:
             print(f"Extraction note: {e}", flush=True)
@@ -138,14 +139,15 @@ if os.path.exists(root_claude) and not os.path.islink(root_claude):
             else:
                 shutil.copy2(s, d)
     shutil.rmtree(root_claude, ignore_errors=True)
-elif os.path.islink(root_claude):
+
+if os.path.islink(root_claude):
     try:
         if os.readlink(root_claude) != transcripts_dir:
             os.unlink(root_claude)
             os.symlink(transcripts_dir, root_claude)
     except Exception:
         pass
-else:
+elif not os.path.exists(root_claude):
     try:
         os.symlink(transcripts_dir, root_claude)
     except Exception:
@@ -198,6 +200,7 @@ if not has_claude_ext:
     if os.path.exists("/content/claude_code_extension.tar.gz"):
         try:
             subprocess.run(["tar", "-xzf", "/content/claude_code_extension.tar.gz", "-C", "/root/.openvscode-server"], check=True, timeout=40)
+            os.unlink("/content/claude_code_extension.tar.gz")
             print("Claude Code extension restored from cache bundle.", flush=True)
         except Exception as e:
             print(f"Extension extract note: {e}", flush=True)
@@ -276,8 +279,15 @@ else:
     subprocess.run(["pkill", "-f", "gdrive_sync_daemon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["pkill", "-f", "cloudflared"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    tunnel_token = os.environ.get("TUNNEL_TOKEN", "")
-    if not tunnel_token and os.path.exists("/content/tunnel_token.txt"):
+    tunnel_token = os.environ.get("TUNNEL_TOKEN", "").strip()
+    if tunnel_token:
+        try:
+            with open("/content/tunnel_token.txt", "w", encoding="utf-8") as tf:
+                tf.write(tunnel_token + "\n")
+            os.chmod("/content/tunnel_token.txt", 0o600)
+        except Exception:
+            pass
+    elif os.path.exists("/content/tunnel_token.txt"):
         with open("/content/tunnel_token.txt") as f:
             tunnel_token = f.read().strip()
 

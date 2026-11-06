@@ -18,6 +18,10 @@ import signal
 import subprocess
 import urllib.request
 
+# Guarantee /usr/local/bin is in PATH for non-interactive SSH spawns
+if "/usr/local/bin" not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = f"/usr/local/bin:/usr/bin:/bin:{os.environ.get('PATH', '')}"
+
 # Ignore SIGHUP so SSH disconnects never terminate this daemon
 try:
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
