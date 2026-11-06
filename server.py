@@ -451,11 +451,31 @@ def upload_all_scripts(session_name):
 def hydrate_session(session_name, force=False):
     """Run hydrate_and_setup.py on the Colab VM via physical file (-f)."""
     hydrate_path = os.path.join(APP_DIR, "hydrate_and_setup.py")
-    cmd = ["exec", "-s", session_name, "-f", hydrate_path, "--timeout", "240"]
+    cmd = ["exec", "-s", session_name, "-f", hydrate_path, "--timeout", "300"]
     if force:
         cmd.extend(["--env", "FORCE_RESTORE=1"])
+    # Pass authoritative credentials via --env to guarantee hydration never fails due to missing files
+    tok_file = os.path.join(APP_DIR, "tunnel_token.txt")
+    if os.path.exists(tok_file):
+        try:
+            with open(tok_file) as tf:
+                tok = tf.read().strip()
+            if tok:
+                cmd.extend(["--env", f"TUNNEL_TOKEN={tok}"])
+        except Exception:
+            pass
+    rc_file = os.path.join(APP_DIR, "rclone.conf")
+    if os.path.exists(rc_file):
+        try:
+            import base64
+            with open(rc_file, "rb") as rf:
+                b64 = base64.b64encode(rf.read()).decode("utf-8")
+            if b64:
+                cmd.extend(["--env", f"RCLONE_CONF_B64={b64}"])
+        except Exception:
+            pass
     log(f"Hydrating services on '{session_name}' (force={force})...")
-    code, out = run_colab(cmd, timeout=260)
+    code, out = run_colab(cmd, timeout=320)
     summary = out.replace("\n", " | ")[-240:] if out else ""
     log(f"Hydration on '{session_name}' finished with exit={code} | {summary}")
     return code == 0

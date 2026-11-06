@@ -34,17 +34,23 @@ if os.path.exists(force_flag_path):
 
 print("=== [1/5] INITIALIZING CREDENTIALS & RCLONE ===", flush=True)
 os.makedirs("/root/.config/rclone", exist_ok=True)
+
+# 1. First priority: copy from /content/rclone.conf
 if os.path.exists("/content/rclone.conf"):
     shutil.copy("/content/rclone.conf", "/root/.config/rclone/rclone.conf")
     os.chmod("/root/.config/rclone/rclone.conf", 0o600)
 
+# 2. Second priority: environment variable passed via colab exec --env RCLONE_CONF_B64=...
 rclone_b64 = os.environ.get("RCLONE_CONF_B64", "") or os.environ.get("RCLONE_CONFIG_BASE64", "")
-if rclone_b64 and not os.path.exists("/root/.config/rclone/rclone.conf"):
+if rclone_b64 and (not os.path.exists("/root/.config/rclone/rclone.conf") or os.path.getsize("/root/.config/rclone/rclone.conf") == 0):
     try:
         import base64
         with open("/root/.config/rclone/rclone.conf", "wb") as f:
             f.write(base64.b64decode(rclone_b64))
         os.chmod("/root/.config/rclone/rclone.conf", 0o600)
+        with open("/content/rclone.conf", "wb") as f:
+            f.write(base64.b64decode(rclone_b64))
+        os.chmod("/content/rclone.conf", 0o600)
         print("Configured rclone.conf from RCLONE_CONF_B64 environment variable.", flush=True)
     except Exception as e:
         print(f"Rclone config decode error: {e}", flush=True)
@@ -72,13 +78,20 @@ if not shutil.which("rclone"):
     except Exception as e:
         print(f"Standalone rclone install error: {e}", flush=True)
 
-# Detect if workspace is already populated
+# Detect if workspace is genuinely populated with active work and chat history
 workspace_dir = "/content/workspace"
-workspace_populated = os.path.exists(workspace_dir) and bool(os.listdir(workspace_dir))
+workspace_items = os.listdir(workspace_dir) if os.path.exists(workspace_dir) else []
+# Only skip restoration if real user files or claude transcripts already exist
+has_real_workspace_data = (
+    os.path.exists(os.path.join(workspace_dir, ".claude_transcripts"))
+    or os.path.exists(os.path.join(workspace_dir, "YUI_PRODUCTION_MANIFEST.md"))
+    or any(f not in ("colab-relay-supervisor", "sync_state.sh", ".rclone") for f in workspace_items)
+)
+workspace_populated = bool(workspace_items) and has_real_workspace_data
 
 if workspace_populated and not FORCE_RESTORE:
     print("=== [SAFE SKIP] WORKSPACE ALREADY POPULATED ===", flush=True)
-    print(f"Directory {workspace_dir} contains active files. Preserving live workspace changes.", flush=True)
+    print(f"Directory {workspace_dir} contains active work ({len(workspace_items)} items). Preserving live workspace changes.", flush=True)
     print("Skipping colab_bundle.tar.gz extraction to protect uncommitted work.", flush=True)
 else:
     # Pull latest state bundle from central Google Drive
