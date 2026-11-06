@@ -73,6 +73,7 @@ relay_state = {
     "total_cycles": 0,
     "last_cycle_time": None,
     "last_cycle_status": "NONE",
+    "last_ssh_status": "NONE",
     "last_backup_time": "NONE",
     "ingress_status": "UNKNOWN",
     "consecutive_failures": 0,
@@ -153,6 +154,23 @@ def setup_credentials():
             json.dump({"enable_update_check": False}, f)
     except Exception as e:
         log(f"Settings write note: {e}")
+
+    # 1b. Ensure ~/.ssh/id_ed25519 keypair exists for `colab ssh` WebSocket bridge
+    try:
+        ssh_dir = os.path.expanduser("~/.ssh")
+        os.makedirs(ssh_dir, exist_ok=True)
+        ed25519_key = os.path.join(ssh_dir, "id_ed25519")
+        if not os.path.exists(ed25519_key):
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", ed25519_key],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            os.chmod(ed25519_key, 0o600)
+            log("Generated ~/.ssh/id_ed25519 keypair for Colab SSH keepalive bridge.")
+    except Exception as e:
+        log(f"SSH keypair setup note: {e}")
 
     # 2. Setup Rclone config from env or local fallback (support multiple aliases)
     rclone_b64 = (
@@ -406,6 +424,7 @@ def upload_all_scripts(session_name):
     files_to_upload = [
         ("ping_a.py", "/content/ping_a.py"),
         ("ping_b.py", "/content/ping_b.py"),
+        ("ssh_keepalive_worker.py", "/content/ssh_keepalive_worker.py"),
         ("rclone.conf", "/content/rclone.conf"),
         ("tunnel_token.txt", "/content/tunnel_token.txt"),
         ("sync_state.sh", "/content/sync_state.sh"),
@@ -473,14 +492,85 @@ def get_current_endpoint(session_name):
     return None
 
 
+def ensure_ssh_nohup_worker(session_name):
+    """
+    Connect to the ongoing Colab session via SSH and ensure the persistent
+    nohup keepalive daemon (/content/ssh_keepalive_worker.py) is running.
+    Because it is launched with nohup + SIGHUP ignored, transient connection
+    drops never interrupt in-VM activity.
+    """
+    remote_cmd = (
+        "if ! pgrep -f ssh_keepalive_worker.py >/dev/null 2>&1; then "
+        "nohup python3 /content/ssh_keepalive_worker.py >/dev/null 2>&1 & "
+        "sleep 1; "
+        "fi; "
+        "PID=$(pgrep -f ssh_keepalive_worker.py | head -n 1); "
+        "echo \"[SSH-NOHUP] worker_pid=${PID:-NONE}\""
+    )
+    code, out = run_colab(["ssh", "-s", session_name, "-c", remote_cmd], timeout=35)
+    out_summary = out.replace("\n", " | ")[:140]
+    log(f"[SSH-INIT] Session '{session_name}' nohup worker check exit={code} | {out_summary}")
+    return code == 0
+
+
+def execute_ssh_pulse(session_name, cycle_num):
+    """
+    Mode 2 of Dual-Mode Keepalive:
+    Directly SSH into the ongoing Colab instance alongside ping_a/ping_b,
+    verify/heal the detached nohup worker (/content/ssh_keepalive_worker.py),
+    and stream active SSH heartbeat commands across the /colab/ssh WebSocket.
+    """
+    start = time.time()
+    remote_cmd = (
+        "if ! pgrep -f ssh_keepalive_worker.py >/dev/null 2>&1; then "
+        "nohup python3 /content/ssh_keepalive_worker.py >/dev/null 2>&1 & "
+        "fi; "
+        "PID=$(pgrep -f ssh_keepalive_worker.py | head -n 1); "
+        f"for t in 1 2 3 4; do "
+        f"date +%s > /content/.ssh_heartbeat; "
+        f"echo \"[SSH-PULSE] cycle={cycle_num} tick=$t/4 nohup_pid=${{PID:-NONE}} ts=$(date +%H:%M:%S)\" | tee -a /content/ssh_pulse.log; "
+        "curl -fsS http://127.0.0.1:8080/api/status >/dev/null 2>&1 || true; "
+        "sleep 5; "
+        "done; "
+        "tail -n 80 /content/ssh_pulse.log > /content/ssh_pulse.log.tmp 2>/dev/null && mv /content/ssh_pulse.log.tmp /content/ssh_pulse.log 2>/dev/null || true"
+    )
+    code, out = run_colab(["ssh", "-s", session_name, "-c", remote_cmd], timeout=45)
+    elapsed = time.time() - start
+    if code == -1 and os.name != "nt":
+        subprocess.run(["pkill", "-f", f"colab_cli.cli ssh.*-s {session_name}"], check=False)
+    out_summary = out.replace("\n", " | ")[-140:] if out else ""
+    ok = (code == 0) and ("[SSH-PULSE]" in out)
+    log(f"[Cycle {cycle_num:04d}] [SSH-MODE] exit={code} in {elapsed:.1f}s | {out_summary}")
+    return ok, code, elapsed, out_summary
+
+
+def _allocate_fresh_session(account_idx, session_name):
+    """Helper to cleanly allocate a brand new Colab VM on account_idx."""
+    acc_num = account_idx + 1
+    log(f"Allocating fresh session '{session_name}' on Account {acc_num}...")
+    code, out = run_colab(["new", "-s", session_name], timeout=150)
+    log(f"colab new output: {out}")
+    if code != 0 and "ready" not in out.lower():
+        c2, o2 = run_colab(["status", "-s", session_name], timeout=30)
+        if c2 != 0 or "not found" in o2.lower():
+            log(f"ERROR: Failed to provision session '{session_name}' on Account {acc_num}: {out}")
+            return False
+    log("Waiting 6s for fresh container initialization...")
+    time.sleep(6)
+    return True
+
+
 def provision_session(account_idx, session_name):
     """
-    Create or verify a Colab session for account_idx, upload all 9 scripts, and run hydration.
-    First checks Google's backend assignments via sync_sessions() to re-adopt existing VMs
-    before falling back to 'colab new', preventing unnecessary node churn.
+    Create or verify a Colab session for account_idx, upload all operational scripts,
+    run hydration, and launch the persistent nohup SSH keepalive daemon.
+    Verifies that upload and hydration actually succeed; if an adopted/existing session
+    is a dead zombie, tears it down and allocates a fresh VM. Returns False on failure
+    so the caller can fail over to the next account in the 3-account pool.
     """
     acc_num = account_idx + 1
-    set_active_token(account_idx)
+    if not set_active_token(account_idx):
+        return False
 
     log(f"Checking status for session '{session_name}' on Account {acc_num}...")
     s_code, s_out = run_colab(["status", "-s", session_name], timeout=35)
@@ -519,24 +609,36 @@ def provision_session(account_idx, session_name):
         except Exception as e:
             log(f"Backend assignment check note on Account {acc_num}: {e}")
 
+    was_existing = is_active
     if not is_active:
-        log(f"Allocating fresh session '{session_name}' on Account {acc_num}...")
-        code, out = run_colab(["new", "-s", session_name], timeout=150)
-        log(f"colab new output: {out}")
-        if code != 0 and "ready" not in out.lower():
-            # Verify via status before declaring failure
-            c2, o2 = run_colab(["status", "-s", session_name], timeout=30)
-            if c2 != 0 or "not found" in o2.lower():
-                log(f"ERROR: Failed to provision session '{session_name}' on Account {acc_num}: {out}")
-                return False
-        log("Waiting 6s for fresh container initialization...")
-        time.sleep(6)
+        if not _allocate_fresh_session(account_idx, session_name):
+            return False
     else:
         log(f"Session '{session_name}' is already active on Account {acc_num}.")
 
     generate_node_info(acc_num, session_name)
-    upload_all_scripts(session_name)
-    hydrate_session(session_name, force=False)
+    upload_ok = upload_all_scripts(session_name)
+
+    # If an existing/re-adopted session failed file upload, it is a dead zombie endpoint.
+    # Stop/prune it and allocate a fresh VM once before giving up on this account.
+    if not upload_ok and was_existing:
+        log(f"WARNING: Existing session '{session_name}' on Account {acc_num} failed upload (zombie runtime). Stopping and allocating fresh VM...")
+        run_colab(["stop", "-s", session_name], timeout=45)
+        if not _allocate_fresh_session(account_idx, session_name):
+            return False
+        generate_node_info(acc_num, session_name)
+        upload_ok = upload_all_scripts(session_name)
+
+    if not upload_ok:
+        log(f"ERROR: Script upload failed on '{session_name}' (Account {acc_num}).")
+        return False
+
+    hydrate_ok = hydrate_session(session_name, force=False)
+    if not hydrate_ok:
+        log(f"ERROR: Hydration failed on '{session_name}' (Account {acc_num}).")
+        return False
+
+    ensure_ssh_nohup_worker(session_name)
 
     ep = get_current_endpoint(session_name) or "ACTIVE"
     with status_lock:
@@ -548,13 +650,14 @@ def provision_session(account_idx, session_name):
 def auto_adopt_or_provision():
     """
     Auto-adopt any currently live Colab VM across the 3 accounts on startup.
-    Runs Safe Smart Hydration on adopted sessions so all scripts and daemons are guaranteed present.
+    Verifies that adopted sessions actually pass script upload + hydration + SSH nohup setup;
+    if an assignment is stale/unreachable, cleans it up and continues across the 3-account pool.
     """
     start_acc_env = int(os.environ.get("STARTING_ACCOUNT", "2"))
     if start_acc_env not in (1, 2, 3):
         start_acc_env = 2
 
-    # Check all 3 accounts starting from STARTING_ACCOUNT
+    # 1. Check all 3 accounts for an existing live assignment starting from STARTING_ACCOUNT
     search_order = [(start_acc_env - 1 + i) % 3 for i in range(3)]
     for idx in search_order:
         if not set_active_token(idx):
@@ -585,43 +688,105 @@ def auto_adopt_or_provision():
                 state.store.add(s)
                 log(f"=== AUTO-ADOPTED running assignment '{a.endpoint}' on Account {acc_num} as '{session_name}' ===")
                 generate_node_info(acc_num, session_name)
-                upload_all_scripts(session_name)
-                hydrate_session(session_name, force=False)
-                return idx, session_name, a.endpoint
+                if upload_all_scripts(session_name) and hydrate_session(session_name, force=False):
+                    ensure_ssh_nohup_worker(session_name)
+                    return idx, session_name, a.endpoint
+                else:
+                    log(f"WARNING: Adopted assignment '{a.endpoint}' on Account {acc_num} is unresponsive. Cleaning up...")
+                    run_colab(["stop", "-s", session_name], timeout=45)
         except Exception as e:
             log(f"Assignment check note for Account {idx+1}: {e}")
 
-    # No existing assignment found; provision fresh on STARTING_ACCOUNT
+    # 2. No healthy existing assignment found; provision fresh across search_order (with automatic failover)
+    for idx in search_order:
+        acc_num = idx + 1
+        session_name = f"colab-prod-node{acc_num}"
+        log(f"Provisioning fresh session '{session_name}' on Account {acc_num}...")
+        if provision_session(idx, session_name):
+            ep = get_current_endpoint(session_name) or "ACTIVE"
+            return idx, session_name, ep
+        log(f"WARNING: Provisioning failed on Account {acc_num}; trying next account in pool...")
+
     target_idx = start_acc_env - 1
     acc_num = target_idx + 1
     session_name = f"colab-prod-node{acc_num}"
-    log(f"No active assignments found across token pool. Provisioning fresh session '{session_name}' on Account {acc_num}...")
-    provision_session(target_idx, session_name)
     ep = get_current_endpoint(session_name) or "UNKNOWN"
     return target_idx, session_name, ep
 
 
+def _reset_session_kernel_ids(session_name):
+    """Clear cached kernel_id/session_id in sessions.json when SSH is alive but Jupyter ZMQ reset."""
+    cfg = os.path.normpath(os.path.expanduser("~/.config/colab-cli/sessions.json"))
+    if os.path.exists(cfg):
+        try:
+            with open(cfg, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if session_name in data:
+                data[session_name]["kernel_id"] = None
+                data[session_name]["session_id"] = None
+                with open(cfg, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+
 def execute_keepalive_pulse(session_name, cycle_num):
     """
-    Execute the validated 40-second active duty cycle via physical file (-f).
-    Maintains the Jupyter kernel in BUSY state and avoids stdin piping under Uvicorn.
+    Execute Dual-Mode Keepalive Pulse:
+      - Mode 1 (Jupyter Kernel Pulse): 40-second active duty cycle via physical file (-f)
+        running ping_a.py / ping_b.py.
+      - Mode 2 (Direct SSH + nohup Daemon + SSH Heartbeat Stream): Concurrent SSH session
+        into the ongoing Colab instance that ensures /content/ssh_keepalive_worker.py is
+        running under nohup and streams active SSH pulses over /colab/ssh.
     """
     script_name = "ping_a.py" if (cycle_num % 2 != 0) else "ping_b.py"
     script_path = os.path.join(APP_DIR, script_name)
     start = time.time()
 
+    ssh_result = {"ok": False, "code": -1, "elapsed": 0.0, "summary": "NOT_RUN"}
+
+    def _ssh_worker():
+        ok, s_code, s_el, s_sum = execute_ssh_pulse(session_name, cycle_num)
+        ssh_result["ok"] = ok
+        ssh_result["code"] = s_code
+        ssh_result["elapsed"] = s_el
+        ssh_result["summary"] = s_sum
+
+    ssh_thread = threading.Thread(target=_ssh_worker, daemon=True)
+    ssh_thread.start()
+
     code, out = run_colab(
         ["exec", "-s", session_name, "-f", script_path, "--timeout", str(int(CLI_TIMEOUT))],
         timeout=PROCESS_TIMEOUT
     )
-    elapsed = time.time() - start
-    out_summary = out.replace("\n", " | ")[:140]
-    success = (code == 0)
-
     if code == -1 and os.name != "nt":
         subprocess.run(["pkill", "-f", f"colab_cli.cli exec -s {session_name}"], check=False)
 
-    log(f"[Cycle {cycle_num:04d}] {script_name} exit={code} in {elapsed:.1f}s | {out_summary}")
+    ssh_thread.join(timeout=20.0)
+
+    elapsed = time.time() - start
+    out_summary = out.replace("\n", " | ")[:140]
+    exec_ok = (code == 0)
+    ssh_ok = ssh_result["ok"]
+
+    # If Jupyter exec failed on a transient ZMQ reset while SSH proved the VM is alive,
+    # reset cached kernel_id/session_id so the next cycle attaches to a clean kernel session.
+    if not exec_ok and ssh_ok:
+        log(f"[Cycle {cycle_num:04d}] Note: {script_name} failed (exit={code}) while SSH pulse succeeded; resetting cached kernel_id for '{session_name}'.")
+        _reset_session_kernel_ids(session_name)
+
+    with status_lock:
+        relay_state["last_ssh_status"] = (
+            f"OK ({ssh_result['elapsed']:.1f}s)"
+            if ssh_ok
+            else f"exit={ssh_result['code']} ({ssh_result['elapsed']:.1f}s)"
+        )
+
+    success = exec_ok or ssh_ok
+    log(
+        f"[Cycle {cycle_num:04d}] DUAL-MODE: {script_name} exit={code} | "
+        f"SSH exit={ssh_result['code']} | total={elapsed:.1f}s | {out_summary}"
+    )
     return success, code, elapsed, out_summary
 
 
@@ -738,13 +903,40 @@ def supervisor_worker():
                 with colab_lock:
                     backup_session(curr_session)
 
-            # Auto-remediation if 3 consecutive keepalive pulses fail
+            # Auto-remediation & automatic account failover if 3 consecutive keepalive pulses fail
             if relay_state["consecutive_failures"] >= 3:
-                log(f"CRITICAL: 3 consecutive keepalive failures on '{curr_session}'! Triggering self-healing...")
+                log(f"CRITICAL: 3 consecutive keepalive failures on '{curr_session}' (Account {curr_idx+1})! Triggering self-healing...")
                 with colab_lock:
-                    provision_session(curr_idx, curr_session)
-                    with status_lock:
-                        relay_state["consecutive_failures"] = 0
+                    healed = provision_session(curr_idx, curr_session)
+                    if healed:
+                        with status_lock:
+                            relay_state["consecutive_failures"] = 0
+                    else:
+                        log(f"WARNING: Self-healing on Account {curr_idx+1} failed (possible ~6h eviction / quota cooldown). Initiating automatic failover...")
+                        for offset in (1, 2):
+                            cand_idx = (curr_idx + offset) % 3
+                            cand_acc_num = cand_idx + 1
+                            cand_session = f"colab-prod-node{cand_acc_num}"
+                            log(f"Attempting emergency failover to Account {cand_acc_num} ('{cand_session}')...")
+                            if provision_session(cand_idx, cand_session):
+                                ep = get_current_endpoint(cand_session) or "ACTIVE"
+                                with status_lock:
+                                    relay_state["active_account_index"] = cand_idx
+                                    relay_state["active_account_num"] = cand_acc_num
+                                    relay_state["active_account_email"] = ACCOUNTS[cand_acc_num]["email"]
+                                    relay_state["active_session"] = cand_session
+                                    relay_state["active_endpoint"] = ep
+                                    relay_state["shift_start_time"] = time.time()
+                                    relay_state["shift_start_ist"] = get_ist_str()
+                                    relay_state["shift_duration_seconds"] = DEFAULT_SHIFT_SECONDS
+                                    relay_state["consecutive_failures"] = 0
+                                curr_idx = cand_idx
+                                curr_session = cand_session
+                                healed = True
+                                log(f"=== EMERGENCY FAILOVER COMPLETE: Account {cand_acc_num} ({ACCOUNTS[cand_acc_num]['email']}) is now serving ===")
+                                break
+                        if not healed:
+                            log("ERROR: All 3 accounts failed provisioning during self-healing; will retry next cycle.")
 
             # Probe public Web IDE ingress every 2 cycles
             if cycle % 2 == 0:
@@ -781,6 +973,7 @@ def get_health():
             "shift_elapsed_mins": relay_state["shift_elapsed_seconds"] // 60,
             "shift_remaining_mins": relay_state["shift_remaining_seconds"] // 60,
             "last_cycle": relay_state["last_cycle_status"],
+            "last_ssh": relay_state.get("last_ssh_status", "NONE"),
             "last_cycle_time": relay_state["last_cycle_time"],
             "last_backup_time": relay_state["last_backup_time"],
             "ingress": relay_state["ingress_status"],

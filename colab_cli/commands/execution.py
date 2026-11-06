@@ -204,6 +204,46 @@ def exec_command(
         s.session_id = sid
         state.store.add(s)
 
+    def _recover_or_prune(curr_rt):
+        from colab_cli.common import _apply_proxy_info
+        try:
+            curr_rt.stop()
+        except Exception:
+            pass
+        try:
+            by_endpoint = {a.endpoint: a for a in state.client.list_assignments()}
+            if s.endpoint in by_endpoint:
+                _apply_proxy_info(s, by_endpoint[s.endpoint].runtime_proxy_info)
+                s.kernel_id = None
+                s.session_id = None
+                state.store.add(s)
+                new_rt = ColabRuntime(
+                    s.url,
+                    s.token,
+                    kernel_id=None,
+                    session_id=None,
+                    on_kernel_started=on_started,
+                    on_session_started=on_sess_started,
+                )
+                new_rt.execute_code(
+                    "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')",
+                    timeout=min(timeout or 30.0, 20.0),
+                )
+                return new_rt
+            else:
+                typer.echo(
+                    f"[colab] Session '{name}' no longer assigned on backend. Cleaning up."
+                )
+                state.prune_session(name)
+                raise typer.Exit(1)
+        except typer.Exit:
+            raise
+        except Exception as retry_err:
+            typer.echo(
+                f"[colab] Session '{name}' proxy refresh/reconnect failed ({retry_err}); keeping session entry for retry."
+            )
+            raise typer.Exit(1)
+
     runtime = ColabRuntime(
         s.url,
         s.token,
@@ -215,49 +255,12 @@ def exec_command(
     try:
         # Ensure we are in /content which is the standard Colab working directory
         runtime.execute_code(
-            "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')"
+            "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')",
+            timeout=min(timeout or 30.0, 20.0),
         )
     except Exception as e:
-        if is_terminal_error(e):
-            # Verify against Google's backend assignments before pruning local state.
-            # Often the runtime proxy token rotated or kernel session reset while the VM is still alive.
-            recovered = False
-            try:
-                from colab_cli.common import _apply_proxy_info
-                by_endpoint = {a.endpoint: a for a in state.client.list_assignments()}
-                if s.endpoint in by_endpoint:
-                    _apply_proxy_info(s, by_endpoint[s.endpoint].runtime_proxy_info)
-                    s.kernel_id = None
-                    s.session_id = None
-                    state.store.add(s)
-                    runtime.stop()
-                    runtime = ColabRuntime(
-                        s.url,
-                        s.token,
-                        kernel_id=None,
-                        session_id=None,
-                        on_kernel_started=on_started,
-                        on_session_started=on_sess_started,
-                    )
-                    runtime.execute_code(
-                        "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')"
-                    )
-                    recovered = True
-                else:
-                    typer.echo(
-                        f"[colab] Session '{name}' no longer assigned on backend. Cleaning up."
-                    )
-                    state.prune_session(name)
-                    raise typer.Exit(1)
-            except typer.Exit:
-                raise
-            except Exception as retry_err:
-                typer.echo(
-                    f"[colab] Session '{name}' proxy refresh/reconnect failed ({retry_err}); keeping session entry for retry."
-                )
-                raise typer.Exit(1)
-            if not recovered:
-                raise typer.Exit(1)
+        if is_terminal_error(e) or isinstance(e, TimeoutError):
+            runtime = _recover_or_prune(runtime)
         else:
             raise e
 
@@ -290,11 +293,22 @@ def exec_command(
             )
             state.store.add(s)
 
-            outputs = runtime.execute_code(
-                code,
-                output_hook=lambda o: display_output(o, output_image),
-                timeout=timeout,
-            )
+            try:
+                outputs = runtime.execute_code(
+                    code,
+                    output_hook=lambda o: display_output(o, output_image),
+                    timeout=timeout,
+                )
+            except Exception as exec_err:
+                if is_terminal_error(exec_err) or isinstance(exec_err, TimeoutError):
+                    runtime = _recover_or_prune(runtime)
+                    outputs = runtime.execute_code(
+                        code,
+                        output_hook=lambda o: display_output(o, output_image),
+                        timeout=timeout,
+                    )
+                else:
+                    raise exec_err
             if "cell" in block:
                 save_output(outputs, block["cell"])
             state.history.log_event(

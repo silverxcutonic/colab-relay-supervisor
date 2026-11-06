@@ -122,6 +122,24 @@ def _resolve_pubkey(identity: Optional[str]) -> str:
         candidate = ssh_dir / name
         if candidate.exists():
             return candidate.read_text().strip()
+
+    # Automatically generate ed25519 keypair if missing (ensures headless/Render compatibility)
+    try:
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        ed25519_key = ssh_dir / "id_ed25519"
+        if not ed25519_key.exists():
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(ed25519_key)],
+                check=True,
+                capture_output=True,
+            )
+            ed25519_key.chmod(0o600)
+            ed25519_pub = ssh_dir / "id_ed25519.pub"
+            if ed25519_pub.exists():
+                return ed25519_pub.read_text().strip()
+    except Exception as e:
+        typer.echo(f"[colab] Warning: Auto-generating SSH key failed: {e}", err=True)
+
     typer.echo(
         "[colab] no SSH public key found in ~/.ssh/. Run "
         "`ssh-keygen -t ed25519` to generate one, or pass --identity.",
@@ -426,31 +444,24 @@ def _ssh_base_args(proxy_command: str, identity: Optional[str]) -> list[str]:
     return args
 
 
-def _run_interactive_ssh(session: SessionState, identity: Optional[str]) -> int:
-    """Spawns an interactive ``ssh`` that uses this CLI as its ProxyCommand.
+def _run_interactive_ssh(
+    session: SessionState, identity: Optional[str], command: Optional[str] = None
+) -> int:
+    """Spawns an interactive or non-interactive ``ssh`` using this CLI as ProxyCommand.
 
-    The subprocess connects to the abstract host ``colab-runtime``; its
-    ProxyCommand re-invokes ``colab ssh --proxy-mode`` to bridge the WebSocket.
-
-    A remote command ``cd``s into ``/content`` (Colab's working dir) and then
-    execs the login shell, so the user lands where their notebooks/uploads live
-    rather than in root's home. ``-t`` forces a PTY (required once a remote
-    command is present) so the exec'd shell is interactive; a missing
-    ``/content`` is tolerated (stderr suppressed, the shell still starts).
-
-    Args:
-      session: The session to connect to.
-      identity: Optional private key path forwarded to ``ssh``.
-
-    Returns:
-      The exit code of the ``ssh`` subprocess.
+    If ``command`` is given, runs that command non-interactively without PTY allocation.
+    Otherwise opens an interactive shell landing in ``/content``.
     """
     ssh_args = _ssh_base_args(_proxy_command(session, identity), identity)
-    ssh_args.append("-t")
-    ssh_args.append(_SSH_HOST)
-    ssh_args.append(
-        f"cd {_DEFAULT_REMOTE_DIR} 2>/dev/null; exec ${{SHELL:-/bin/bash}} -l"
-    )
+    if command:
+        ssh_args.append(_SSH_HOST)
+        ssh_args.append(f"cd {_DEFAULT_REMOTE_DIR} 2>/dev/null; {command}")
+    else:
+        ssh_args.append("-t")
+        ssh_args.append(_SSH_HOST)
+        ssh_args.append(
+            f"cd {_DEFAULT_REMOTE_DIR} 2>/dev/null; exec ${{SHELL:-/bin/bash}} -l"
+        )
     return subprocess.call(ssh_args)
 
 
@@ -578,7 +589,25 @@ def _run_proxy_bridge(
         _install_rm_signal_handlers(_do_rm)
 
     pubkey = _resolve_pubkey(identity)
-    ws = _connect_websocket(_build_ws_url(s), pubkey)
+    try:
+        ws = _connect_websocket(_build_ws_url(s), pubkey)
+    except typer.Exit:
+        # Attempt proxy token refresh from backend assignments before giving up
+        try:
+            from colab_cli.common import _apply_proxy_info, state
+
+            by_endpoint = {a.endpoint: a for a in state.client.list_assignments()}
+            if s.endpoint in by_endpoint:
+                _apply_proxy_info(s, by_endpoint[s.endpoint].runtime_proxy_info)
+                state.store.add(s)
+                ws = _connect_websocket(_build_ws_url(s), pubkey)
+            else:
+                state.prune_session(s.name)
+                raise
+        except typer.Exit:
+            raise
+        except Exception:
+            raise typer.Exit(code=1)
     try:
         return _bridge_proxy_mode(ws)
     finally:
@@ -586,19 +615,13 @@ def _run_proxy_bridge(
 
 
 def _run_interactive_shell(
-    s: SessionState, identity: Optional[str], created: bool, rm: bool
+    s: SessionState,
+    identity: Optional[str],
+    created: bool,
+    rm: bool,
+    command: Optional[str] = None,
 ) -> int:
-    """Runs the interactive ssh shell, honoring ``--rm`` on exit.
-
-    Args:
-      s: The session to connect to.
-      identity: Optional private key path forwarded to ssh.
-      created: Whether this command auto-created the runtime.
-      rm: If True, stop an auto-created runtime on exit.
-
-    Returns:
-      The exit code of the ssh subprocess.
-    """
+    """Runs the interactive ssh shell (or non-interactive command), honoring ``--rm`` on exit."""
     if rm and not created:
         typer.echo(
             "[colab] --rm ignored: only a runtime auto-created by `colab ssh` "
@@ -606,7 +629,7 @@ def _run_interactive_shell(
             err=True,
         )
     try:
-        return _run_interactive_ssh(s, identity)
+        return _run_interactive_ssh(s, identity, command=command)
     finally:
         if created and rm:
             _stop_session(s.name)
@@ -615,6 +638,14 @@ def _run_interactive_shell(
 def ssh(
     session: Annotated[
         Optional[str], typer.Option("-s", "--session", help="Session name")
+    ] = None,
+    command: Annotated[
+        Optional[str],
+        typer.Option(
+            "-c",
+            "--command",
+            help="Execute a non-interactive command over SSH in /content.",
+        ),
     ] = None,
     proxy_mode: Annotated[
         bool,
@@ -699,7 +730,7 @@ def ssh(
 
     s, created = _select_interactive_session(session, gpu, tpu, high_mem=high_mem)
     _warn_accelerator_ignored(gpu, tpu, created, high_mem=high_mem)
-    raise typer.Exit(code=_run_interactive_shell(s, identity, created, rm))
+    raise typer.Exit(code=_run_interactive_shell(s, identity, created, rm, command=command))
 
 
 def register(app: typer.Typer):

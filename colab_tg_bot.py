@@ -233,20 +233,36 @@ def run_monitor_loop(account_num, session_name):
     email = ACCOUNTS.get(account_num, f"Account {account_num}")
     log(f"Starting Colab In-VM Supervisor: Account {account_num} ({email}), Session: {session_name}")
 
-    initial_uptime = get_uptime_seconds()
+    raw_uptime = get_uptime_seconds()
+    shift_anchor_file = "/content/.shift_start_uptime"
+    if os.path.exists(shift_anchor_file):
+        try:
+            with open(shift_anchor_file, "r") as af:
+                shift_start_uptime = float(af.read().strip())
+        except Exception:
+            shift_start_uptime = raw_uptime
+    else:
+        shift_start_uptime = raw_uptime
+        try:
+            with open(shift_anchor_file, "w") as af:
+                af.write(str(shift_start_uptime))
+        except Exception:
+            pass
+
+    initial_uptime = max(0.0, raw_uptime - shift_start_uptime)
     startup_msg = (
         f"🚀 *Colab Relay Node Online!* (Shift Started)\n\n"
         f"👤 *Account:* Account {account_num} (`{email}`)\n"
         f"📦 *Session:* `{session_name}`\n"
         f"🌐 *Web IDE:* https://colab.silver-xf.bond\n"
-        f"⏱️ *Initial VM Uptime:* `{format_duration(initial_uptime)}`\n"
+        f"⏱️ *Shift Elapsed:* `{format_duration(initial_uptime)}` (VM Uptime: `{format_duration(raw_uptime)}`)\n"
         f"🎯 *Shift Target:* 8 Hours (Continuous)\n"
         f"🕒 *Started At:* `{get_ist_str()}`\n\n"
         f"💡 *Mobile Fail-Safe:* Tap the button below anytime to checkpoint your workspace to Google Drive."
     )
     send_message(startup_msg, reply_markup=get_backup_keyboard())
 
-    # Alert milestones (elapsed seconds since container boot)
+    # Alert milestones (elapsed seconds since shift start)
     milestones = {
         7200: ("2h", False),
         14400: ("4h", False),
@@ -264,7 +280,7 @@ def run_monitor_loop(account_num, session_name):
             milestones[threshold] = (milestones[threshold][0], True)
 
     while True:
-        uptime = get_uptime_seconds()
+        uptime = max(0.0, get_uptime_seconds() - shift_start_uptime)
         remaining = max(0, SHIFT_DURATION - uptime)
 
         # 2-Hour Checkpoint

@@ -35,14 +35,27 @@ def get_status_code(e: Exception) -> Optional[int]:
 
 
 def is_terminal_error(e: Exception) -> bool:
-    """Checks if an exception indicates a lost session (404/401)."""
+    """Checks if an exception indicates a lost session or broken runtime channel."""
     code = get_status_code(e)
-    if code in (404, 401):
+    if code in (404, 401, 403, 502, 503, 504):
         return True
     # Some exceptions from jupyter-kernel-client might wrap the real one or be different
     err_msg = str(e)
-    if "404" in err_msg or "401" in err_msg:
-        return True
+    for token in (
+        "404",
+        "401",
+        "403",
+        "502",
+        "503",
+        "504",
+        "Connection was lost",
+        "WebSocketConnectionClosedException",
+        "Connection refused",
+        "Connection reset",
+        "Handshake status",
+    ):
+        if token in err_msg:
+            return True
     return False
 
 

@@ -316,6 +316,14 @@ if os.path.exists(tg_bot_script):
 else:
     print("Notice: /content/colab_tg_bot.py not found, skipping bot supervisor start.", flush=True)
 
+ssh_keepalive_script = "/content/ssh_keepalive_worker.py"
+if os.path.exists(ssh_keepalive_script):
+    subprocess.run(
+        ["bash", "-c", "nohup python3 /content/ssh_keepalive_worker.py >/dev/null 2>&1 &"],
+        check=False,
+    )
+    print("In-VM nohup SSH keepalive daemon ensured.", flush=True)
+
 print("=== [6/6] VERIFYING LOCAL READINESS ===", flush=True)
 try:
     import urllib.request
