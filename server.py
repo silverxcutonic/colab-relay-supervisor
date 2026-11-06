@@ -65,7 +65,7 @@ relay_state = {
     "active_account_email": ACCOUNTS[1]["email"],
     "active_session": "colab-prod-node1",
     "active_endpoint": "UNKNOWN",
-    "shift_start_time": time.time(),
+    "shift_start_time": 0,
     "shift_start_ist": "",
     "shift_duration_seconds": DEFAULT_SHIFT_SECONDS,
     "shift_elapsed_seconds": 0,
@@ -85,8 +85,10 @@ relay_state = {
 }
 
 
-def get_ist_str():
-    ist_time = time.gmtime(time.time() + 19800)
+def get_ist_str(epoch=None):
+    if epoch is None:
+        epoch = time.time()
+    ist_time = time.gmtime(epoch + 19800)
     return time.strftime("%Y-%m-%d %I:%M:%S %p IST", ist_time)
 
 
@@ -292,8 +294,18 @@ def setup_credentials():
                     log(f"Loaded local token file for {acc['name']} ({acc['email']})")
                     break
 
-    # 5. Log Environment Variable Health Audit (Zero Plaintext Secrets)
+    # 5. Setup Telegram Config file if credentials exist
     tg_bot, tg_chat = get_tg_credentials()
+    if tg_bot and tg_chat:
+        try:
+            with open(LOCAL_TG_CONFIG, "w", encoding="utf-8") as f:
+                json.dump({"tg_bot_token": tg_bot, "tg_chat_id": tg_chat}, f, indent=2)
+            os.chmod(LOCAL_TG_CONFIG, 0o600)
+            log("Configured tg_config.json from environment variables.")
+        except Exception as e:
+            log(f"Telegram config file write error: {e}")
+
+    # 6. Log Environment Variable Health Audit (Zero Plaintext Secrets)
     has_rclone = os.path.exists(RCLONE_CONF_PATH) or os.path.exists(LOCAL_RCLONE_CONF)
     has_tunnel = os.path.exists(LOCAL_TUNNEL_TOKEN) and os.path.getsize(LOCAL_TUNNEL_TOKEN) > 10
     has_t1 = os.path.exists(os.path.join(TOKENS_DIR, "account_1.json"))
@@ -401,13 +413,13 @@ def get_tg_credentials():
 def generate_node_info(account_num, session_name):
     """Write node_info.json so in-VM colab_tg_bot.py knows the active account, session, and Telegram credentials."""
     tg_bot_token, tg_chat_id = get_tg_credentials()
-    shift_epoch = relay_state.get("shift_start_time", time.time())
+    shift_epoch = relay_state.get("shift_start_time") or time.time()
     info = {
         "account": account_num,
         "email": ACCOUNTS.get(account_num, {}).get("email", f"Account {account_num}"),
         "session": session_name,
         "shift_start_epoch": shift_epoch,
-        "start_time_ist": get_ist_str(),
+        "start_time_ist": get_ist_str(shift_epoch),
         "target_hours": 8,
         "tg_bot_token": tg_bot_token,
         "tg_chat_id": tg_chat_id
@@ -675,26 +687,48 @@ def provision_session(account_idx, session_name):
 
 def _sync_adopted_shift_epoch(session_name):
     """Preserve true shift start time when adopting an already-running Colab VM."""
-    probe = (
-        "import os, time\n"
-        "if os.path.exists('/content/.shift_start_epoch'):\n"
-        "    print('SHIFT_EPOCH:' + open('/content/.shift_start_epoch').read().strip())\n"
-        "elif os.path.exists('/proc/uptime'):\n"
-        "    up = float(open('/proc/uptime').read().split()[0])\n"
-        "    print('SHIFT_EPOCH:' + str(time.time() - up))\n"
+    remote_cmd = (
+        "python3 -c \""
+        "import os, time; "
+        "ep = None; "
+        "ep_f = '/content/.shift_start_epoch'; "
+        "up_f = '/proc/uptime'; "
+        "now = time.time(); "
+        "if os.path.exists(ep_f): "
+        "  try: ep = float(open(ep_f).read().strip()); "
+        "  except: pass; "
+        "if ep is None and os.path.exists(up_f): "
+        "  try: ep = now - float(open(up_f).read().split()[0]); "
+        "  except: pass; "
+        "if ep is not None: "
+        "  print('SHIFT_EPOCH:' + str(ep)); "
+        "  open('/content/.tg_startup_sent', 'a').close(); "
+        "  elapsed = now - ep; "
+        "  if elapsed >= 7200: open('/content/.milestone_7200_sent', 'a').close(); "
+        "  if elapsed >= 14400: open('/content/.milestone_14400_sent', 'a').close(); "
+        "  if elapsed >= 21600: open('/content/.milestone_21600_sent', 'a').close(); "
+        "\""
     )
-    code, out = run_colab(["exec", "-s", session_name, "-c", probe, "--timeout", "20"], timeout=25)
+    code, out = run_colab(["ssh", "-s", session_name, "-c", remote_cmd], timeout=35)
     if code == 0 and "SHIFT_EPOCH:" in out:
         try:
-            ep_val = float(out.split("SHIFT_EPOCH:")[-1].splitlines()[0].strip())
+            line = [l for l in out.splitlines() if "SHIFT_EPOCH:" in l][-1]
+            ep_val = float(line.split("SHIFT_EPOCH:")[-1].strip())
             if 0 < (time.time() - ep_val) < DEFAULT_SHIFT_SECONDS:
                 with status_lock:
                     relay_state["shift_start_time"] = ep_val
-                log(f"Synchronized adopted VM shift clock: {(time.time() - ep_val)/3600:.2f}h elapsed.")
+                    relay_state["shift_start_ist"] = get_ist_str(ep_val)
+                log(f"Synchronized adopted VM shift clock: {(time.time() - ep_val)/3600:.2f}h elapsed (Started: {relay_state['shift_start_ist']}).")
                 return ep_val
-        except Exception:
-            pass
-    return time.time()
+        except Exception as e:
+            log(f"Warning: Shift epoch parse error: {e}")
+    log("Warning: Could not read adopted VM shift epoch over SSH. Starting fresh shift timer.")
+    now = time.time()
+    with status_lock:
+        if not relay_state.get("shift_start_time"):
+            relay_state["shift_start_time"] = now
+            relay_state["shift_start_ist"] = get_ist_str(now)
+    return relay_state["shift_start_time"]
 
 
 def auto_adopt_or_provision():
@@ -874,8 +908,9 @@ def supervisor_worker():
         relay_state["active_session"] = curr_session
         relay_state["active_endpoint"] = endpoint
         if not relay_state.get("shift_start_time"):
-            relay_state["shift_start_time"] = time.time()
-        relay_state["shift_start_ist"] = get_ist_str()
+            now = time.time()
+            relay_state["shift_start_time"] = now
+            relay_state["shift_start_ist"] = get_ist_str(now)
 
     cycle = 0
     while True:

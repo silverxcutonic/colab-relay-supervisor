@@ -320,22 +320,18 @@ def check_tg_bot_alive():
         return False
 
 if os.path.exists(tg_bot_script):
-    if check_tg_bot_alive() and not FORCE_RESTORE:
-        print("=== [SAFE SKIP] TELEGRAM BOT SUPERVISOR ALREADY ACTIVE ===", flush=True)
-        print("Active in-VM Telegram supervisor preserved without restart.", flush=True)
-    else:
-        subprocess.run(["pkill", "-f", "colab_tg_bot.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with open("/tmp/colab_tg_bot.log", "a") as log_tg:
-            subprocess.Popen(
-                [sys.executable, tg_bot_script],
-                stdout=log_tg,
-                stderr=log_tg,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                close_fds=True
-            )
-        print("In-VM Telegram Bot Supervisor launched successfully (detached process).", flush=True)
-        time.sleep(2)
+    subprocess.run(["pkill", "-f", "colab_tg_bot.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open("/tmp/colab_tg_bot.log", "a") as log_tg:
+        subprocess.Popen(
+            [sys.executable, tg_bot_script],
+            stdout=log_tg,
+            stderr=log_tg,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True
+        )
+    print("In-VM Telegram Bot Supervisor launched with latest code (detached process).", flush=True)
+    time.sleep(2)
 else:
     print("Notice: /content/colab_tg_bot.py not found, skipping bot supervisor start.", flush=True)
 
