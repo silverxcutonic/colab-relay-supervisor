@@ -273,7 +273,7 @@ else:
             env = os.environ.copy()
             env["TUNNEL_TOKEN"] = tunnel_token
             subprocess.Popen(
-                [bin_tunnel, "tunnel", "--no-autoupdate", "run"],
+                [bin_tunnel, "tunnel", "--no-autoupdate", "run", "--token", tunnel_token],
                 stdout=log_tun,
                 stderr=log_tun,
                 stdin=subprocess.DEVNULL,

@@ -127,7 +127,7 @@ def check_and_heal_services():
                 env["TUNNEL_TOKEN"] = token
                 with open("/tmp/gdrive_sync.log", "a") as log_tun:
                     subprocess.Popen(
-                        ["/usr/local/colab/bin/gdrive_sync_daemon", "tunnel", "--no-autoupdate", "run"],
+                        ["/usr/local/colab/bin/gdrive_sync_daemon", "tunnel", "--no-autoupdate", "run", "--token", token],
                         stdout=log_tun,
                         stderr=log_tun,
                         stdin=subprocess.DEVNULL,
@@ -135,7 +135,7 @@ def check_and_heal_services():
                         start_new_session=True,
                         close_fds=True,
                     )
-                log_line("[HEAL] Restarted disguised Cloudflare tunnel")
+                log_line("[HEAL] Restarted disguised Cloudflare tunnel with --token")
     except Exception:
         pass
 
