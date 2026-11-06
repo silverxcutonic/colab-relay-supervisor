@@ -26,7 +26,7 @@ from colab_cli.history import HistoryLogger
 from colab_cli.state import SessionState, StateStore, SettingsStore
 
 # Headroom so a token doesn't expire mid-command.
-TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
+TOKEN_REFRESH_MARGIN = timedelta(minutes=10)
 
 
 def _apply_proxy_info(s: SessionState, info: RuntimeProxyInfo):
@@ -98,13 +98,17 @@ class State:
             not s.token_expires_at
             or s.token_expires_at - datetime.now(timezone.utc) <= TOKEN_REFRESH_MARGIN
         ):
-            by_endpoint = {a.endpoint: a for a in self.client.list_assignments()}
-            if s.endpoint in by_endpoint:
-                _apply_proxy_info(s, by_endpoint[s.endpoint].runtime_proxy_info)
-                self.store.add(s)
-            else:
-                self.prune_session(name)
-                s = None
+            try:
+                by_endpoint = {a.endpoint: a for a in self.client.list_assignments()}
+                if s.endpoint in by_endpoint:
+                    _apply_proxy_info(s, by_endpoint[s.endpoint].runtime_proxy_info)
+                    self.store.add(s)
+                else:
+                    self.prune_session(name)
+                    s = None
+            except Exception:
+                # Transient network/API error fetching assignments; keep local session
+                pass
 
         if s is None and not ignore_missing_session:
             typer.echo(f"[colab] Session '{name}' not found.")

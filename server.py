@@ -45,8 +45,8 @@ NODE_INFO_PATH = os.path.join(APP_DIR, "node_info.json")
 DEFAULT_SHIFT_SECONDS = 8 * 3600       # 8 hours (28,800 seconds)
 HANDOVER_THRESHOLD_SECONDS = 28500     # 7 hours 55 minutes (475 minutes)
 PING_CADENCE = 50.0                    # 50-second duty cycle
-CLI_TIMEOUT = 70.0                     # 70-second CLI execution timeout
-PROCESS_TIMEOUT = 75.0                 # 75-second Python subprocess timeout
+CLI_TIMEOUT = 85.0                     # 85-second CLI execution timeout
+PROCESS_TIMEOUT = 95.0                 # 95-second Python subprocess timeout
 
 ACCOUNTS = {
     1: {"id": "acc-01", "name": "Account 1", "email": "sagesilveryt@gmail.com", "token_env": "COLAB_TOKEN_1", "file": "account_1.json"},
@@ -60,10 +60,10 @@ log_history = collections.deque(maxlen=250)
 
 relay_state = {
     "status": "INITIALIZING",
-    "active_account_index": 0,
-    "active_account_num": 1,
-    "active_account_email": ACCOUNTS[1]["email"],
-    "active_session": "colab-prod-node1",
+    "active_account_index": 1,
+    "active_account_num": 2,
+    "active_account_email": ACCOUNTS[2]["email"],
+    "active_session": "colab-prod-node2",
     "active_endpoint": "UNKNOWN",
     "shift_start_time": time.time(),
     "shift_start_ist": "",
@@ -305,10 +305,38 @@ def setup_credentials():
         }
 
 
-def set_active_token(account_idx):
-    """Switch active token.json to 0-based account_idx (0 -> Account 1, 1 -> Account 2, 2 -> Account 3)."""
+_active_token_account_idx = None
+
+
+def set_active_token(account_idx, force=False):
+    """Switch active token.json to 0-based account_idx (0 -> Account 1, 1 -> Account 2, 2 -> Account 3).
+    Preserves refreshed OAuth access tokens instead of overwriting token.json on every 50s cycle.
+    """
+    global _active_token_account_idx
     acc_num = account_idx + 1
     tok_src = os.path.join(TOKENS_DIR, f"account_{acc_num}.json")
+
+    # If already on this account and token.json exists, sync any refreshed OAuth token back to TOKENS_DIR
+    if not force and _active_token_account_idx == account_idx and os.path.exists(TOKEN_JSON):
+        try:
+            if os.path.getsize(TOKEN_JSON) > 20:
+                shutil.copyfile(TOKEN_JSON, tok_src)
+                os.chmod(tok_src, 0o600)
+        except Exception:
+            pass
+        return True
+
+    # Before switching away from a previous account, persist its refreshed token.json back to TOKENS_DIR
+    if _active_token_account_idx is not None and _active_token_account_idx != account_idx and os.path.exists(TOKEN_JSON):
+        prev_num = _active_token_account_idx + 1
+        prev_dst = os.path.join(TOKENS_DIR, f"account_{prev_num}.json")
+        try:
+            if os.path.getsize(TOKEN_JSON) > 20:
+                shutil.copyfile(TOKEN_JSON, prev_dst)
+                os.chmod(prev_dst, 0o600)
+        except Exception:
+            pass
+
     if os.path.exists(tok_src):
         os.makedirs(CFG_DIR, exist_ok=True)
         shutil.copyfile(tok_src, TOKEN_JSON)
@@ -322,6 +350,7 @@ def set_active_token(account_idx):
             state._sessions = None
         except Exception:
             pass
+        _active_token_account_idx = account_idx
         log(f"Active CLI token switched to Account {acc_num} ({ACCOUNTS[acc_num]['email']})")
         return True
     log(f"WARNING: Token file {tok_src} not found for Account {acc_num}!")
@@ -447,6 +476,8 @@ def get_current_endpoint(session_name):
 def provision_session(account_idx, session_name):
     """
     Create or verify a Colab session for account_idx, upload all 9 scripts, and run hydration.
+    First checks Google's backend assignments via sync_sessions() to re-adopt existing VMs
+    before falling back to 'colab new', preventing unnecessary node churn.
     """
     acc_num = account_idx + 1
     set_active_token(account_idx)
@@ -456,6 +487,37 @@ def provision_session(account_idx, session_name):
     s_lower = s_out.lower()
     is_not_found = ("not found" in s_lower) or ("no active sessions" in s_lower)
     is_active = (s_code == 0) and (not is_not_found) and (("idle" in s_lower) or ("busy" in s_lower) or (session_name in s_out))
+
+    if not is_active:
+        # Before calling 'colab new', check if the VM is still alive on Google's backend
+        try:
+            from colab_cli.common import state
+            from colab_cli.state import SessionState
+
+            state._client = None
+            state._sessions = None
+            _, assignments = state.sync_sessions()
+            if assignments:
+                a = assignments[0]
+                s = SessionState(
+                    name=session_name,
+                    token=a.runtime_proxy_info.token,
+                    url=a.runtime_proxy_info.url,
+                    endpoint=a.endpoint,
+                    token_expires_at=(
+                        a.runtime_proxy_info.expires_at()
+                        if hasattr(a, "runtime_proxy_info")
+                        else None
+                    ),
+                    variant=getattr(a.variant, "name", "DEFAULT"),
+                    accelerator=getattr(a.accelerator, "value", "NONE"),
+                    machine_shape=getattr(a.machine_shape, "name", "STANDARD"),
+                )
+                state.store.add(s)
+                is_active = True
+                log(f"=== RE-ADOPTED live backend assignment '{a.endpoint}' on Account {acc_num} as '{session_name}' (avoided colab new) ===")
+        except Exception as e:
+            log(f"Backend assignment check note on Account {acc_num}: {e}")
 
     if not is_active:
         log(f"Allocating fresh session '{session_name}' on Account {acc_num}...")
@@ -488,9 +550,9 @@ def auto_adopt_or_provision():
     Auto-adopt any currently live Colab VM across the 3 accounts on startup.
     Runs Safe Smart Hydration on adopted sessions so all scripts and daemons are guaranteed present.
     """
-    start_acc_env = int(os.environ.get("STARTING_ACCOUNT", "1"))
+    start_acc_env = int(os.environ.get("STARTING_ACCOUNT", "2"))
     if start_acc_env not in (1, 2, 3):
-        start_acc_env = 1
+        start_acc_env = 2
 
     # Check all 3 accounts starting from STARTING_ACCOUNT
     search_order = [(start_acc_env - 1 + i) % 3 for i in range(3)]

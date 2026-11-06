@@ -219,12 +219,47 @@ def exec_command(
         )
     except Exception as e:
         if is_terminal_error(e):
-            typer.echo(
-                f"[colab] Session '{name}' appears to be lost (404/401). Cleaning up."
-            )
-            state.prune_session(name)
-            raise typer.Exit(1)
-        raise e
+            # Verify against Google's backend assignments before pruning local state.
+            # Often the runtime proxy token rotated or kernel session reset while the VM is still alive.
+            recovered = False
+            try:
+                from colab_cli.common import _apply_proxy_info
+                by_endpoint = {a.endpoint: a for a in state.client.list_assignments()}
+                if s.endpoint in by_endpoint:
+                    _apply_proxy_info(s, by_endpoint[s.endpoint].runtime_proxy_info)
+                    s.kernel_id = None
+                    s.session_id = None
+                    state.store.add(s)
+                    runtime.stop()
+                    runtime = ColabRuntime(
+                        s.url,
+                        s.token,
+                        kernel_id=None,
+                        session_id=None,
+                        on_kernel_started=on_started,
+                        on_session_started=on_sess_started,
+                    )
+                    runtime.execute_code(
+                        "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')"
+                    )
+                    recovered = True
+                else:
+                    typer.echo(
+                        f"[colab] Session '{name}' no longer assigned on backend. Cleaning up."
+                    )
+                    state.prune_session(name)
+                    raise typer.Exit(1)
+            except typer.Exit:
+                raise
+            except Exception as retry_err:
+                typer.echo(
+                    f"[colab] Session '{name}' proxy refresh/reconnect failed ({retry_err}); keeping session entry for retry."
+                )
+                raise typer.Exit(1)
+            if not recovered:
+                raise typer.Exit(1)
+        else:
+            raise e
 
     try:
         is_nb = file and file.endswith(".ipynb")
@@ -320,12 +355,47 @@ def repl(
         )
     except Exception as e:
         if is_terminal_error(e):
-            typer.echo(
-                f"[colab] Session '{name}' appears to be lost (404/401). Cleaning up."
-            )
-            state.prune_session(name)
-            raise typer.Exit(1)
-        raise e
+            # Verify against Google's backend assignments before pruning local state.
+            # Often the runtime proxy token rotated or kernel session reset while the VM is still alive.
+            recovered = False
+            try:
+                from colab_cli.common import _apply_proxy_info
+                by_endpoint = {a.endpoint: a for a in state.client.list_assignments()}
+                if s.endpoint in by_endpoint:
+                    _apply_proxy_info(s, by_endpoint[s.endpoint].runtime_proxy_info)
+                    s.kernel_id = None
+                    s.session_id = None
+                    state.store.add(s)
+                    runtime.stop()
+                    runtime = ColabRuntime(
+                        s.url,
+                        s.token,
+                        kernel_id=None,
+                        session_id=None,
+                        on_kernel_started=on_started,
+                        on_session_started=on_sess_started,
+                    )
+                    runtime.execute_code(
+                        "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')"
+                    )
+                    recovered = True
+                else:
+                    typer.echo(
+                        f"[colab] Session '{name}' no longer assigned on backend. Cleaning up."
+                    )
+                    state.prune_session(name)
+                    raise typer.Exit(1)
+            except typer.Exit:
+                raise
+            except Exception as retry_err:
+                typer.echo(
+                    f"[colab] Session '{name}' proxy refresh/reconnect failed ({retry_err}); keeping session entry for retry."
+                )
+                raise typer.Exit(1)
+            if not recovered:
+                raise typer.Exit(1)
+        else:
+            raise e
 
     if not is_stdin_tty():
         code = sys.stdin.read()

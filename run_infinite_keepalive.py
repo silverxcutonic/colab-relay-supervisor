@@ -81,7 +81,7 @@ def main():
         start = time.time()
 
         try:
-            r = run_colab(["exec", "-s", SESSION_NAME, "-f", script_path, "--timeout", "70"], timeout=75)
+            r = run_colab(["exec", "-s", SESSION_NAME, "-f", script_path, "--timeout", "85"], timeout=95)
             elapsed = time.time() - start
             out_summary = r.stdout.strip().replace("\n", " | ")[:120]
             log(f"[Cycle {cycle:04d}] {name} exit={r.returncode} in {elapsed:.1f}s | {out_summary}")
