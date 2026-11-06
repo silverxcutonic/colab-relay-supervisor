@@ -103,9 +103,6 @@ class State:
                 if s.endpoint in by_endpoint:
                     _apply_proxy_info(s, by_endpoint[s.endpoint].runtime_proxy_info)
                     self.store.add(s)
-                else:
-                    self.prune_session(name)
-                    s = None
             except Exception:
                 # Transient network/API error fetching assignments; keep local session
                 pass
@@ -137,17 +134,10 @@ class State:
         by_endpoint = {a.endpoint: a for a in assignments}
 
         self._sessions = local_sessions
-        pruned = 0
         for name, s in list(self._sessions.items()):
-            if s.endpoint not in by_endpoint:
-                self.prune_session(name)
-                pruned += 1
-            else:
+            if s.endpoint in by_endpoint:
                 _apply_proxy_info(s, by_endpoint[s.endpoint].runtime_proxy_info)
                 self.store.add(s)
-
-        if pruned > 0:
-            typer.echo(f"[colab] Pruned {pruned} stale local session(s).")
 
         return self._sessions, assignments
 
